@@ -449,6 +449,43 @@ describe("feedback surface", () => {
 		expect(rig.harness.adds).toBe(addsBefore);
 	});
 
+	test("flag-like multiline annotation values remain bound to their options", async () => {
+		const rig = await freshRig();
+		cleaners.push(rig.cleanup);
+		const { viewToken } = await reviewPayload(rig);
+		const summary = "--focus\nkeep this 'quoted' text literal";
+		const rationale = "--repo=/unrelated\n$(do-not-execute)";
+		const result = await rig.host.tools.hunk_comment.execute(
+			"write",
+			{ kind: "line", viewToken, filePath: "seed.txt", side: "new", line: 2, summary, rationale },
+			undefined, undefined, rig.ctx,
+		);
+		expect(result.content[0].text).toContain("Comment created");
+		const args = rig.harness.lastAddArgs ?? [];
+		expect(args.filter(arg => arg.startsWith("--summary="))).toEqual([`--summary=${summary}`]);
+		expect(args.filter(arg => arg.startsWith("--rationale="))).toEqual([`--rationale=${rationale}`]);
+		expect(args).toContain("--file=seed.txt");
+		expect(args).toContain("--new-line=2");
+		expect(args).not.toContain("--focus");
+		expect(args).not.toContain("--repo=/unrelated");
+	});
+
+	test("flag-like reply IDs cannot become file anchors or target selectors", async () => {
+		const rig = await freshRig();
+		cleaners.push(rig.cleanup);
+		const { viewToken } = await reviewPayload(rig);
+		const replyTo = "--repo=/unrelated";
+		await rig.host.tools.hunk_comment.execute(
+			"reply", { kind: "reply", viewToken, replyTo, summary: "Keep the thread anchor" },
+			undefined, undefined, rig.ctx,
+		);
+		const args = rig.harness.lastAddArgs ?? [];
+		expect(args.filter(arg => arg.startsWith("--reply-to="))).toEqual([`--reply-to=${replyTo}`]);
+		expect(args.some(arg => arg === "--file" || arg.startsWith("--file="))).toBe(false);
+		expect(args.some(arg => /^--(?:old|new)-line(?:=|$)/.test(arg))).toBe(false);
+		expect(args).not.toContain("--repo=/unrelated");
+	});
+
 
 	test("generation change during a successful write is reported honestly", async () => {
 		const rig = await freshRig();
