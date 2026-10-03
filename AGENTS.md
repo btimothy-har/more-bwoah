@@ -1,32 +1,33 @@
 # Development Rules
 
-`more-bwoah` is the extension library for
-[`btimothy-har/bwoah-my-pi`](https://github.com/btimothy-har/bwoah-my-pi) —
-the `omp` coding agent. Cross-repo facts (fork context, read-only sibling
-rules) live in `~/.omp/agent/shared-contexts/bwoah-shared-context.md`, injected
-into sessions in both checkouts; this file governs work in this repo.
+`more-bwoah` is the extension library for the
+[`omp`](https://github.com/btimothy-har/bwoah-my-pi) coding agent. Cross-repo
+facts are injected into sessions via
+`~/.omp/agent/shared-contexts/bwoah-shared-context.md`; this file owns the
+conventions of this repo.
 
-## Repo purpose
+## Repo layout
 
-Each extension is a directory consumed by `omp`'s extension system:
+One extension per top-level directory, consumed by `omp`'s extension loader:
 
 - `<name>/index.ts` — default-exports a factory `(pi: ExtensionAPI) => void | Promise<void>`
 - or `<name>/package.json` with an `omp`/`pi` → `extensions: [...]` manifest
   for multi-file extensions
 
-Loading is one level deep and symlink-friendly; the authoring surface is
-documented in the parent's `docs/extensions.md` and `docs/extension-loading.md`.
-The parent checkout is a related read-only workspace in sessions here — read it
-for reference, never modify it from this repo's sessions.
+Loading is one level deep and symlink-friendly. The extension API surface and
+loader behavior are documented in the `omp` repo (`docs/extensions.md`,
+`docs/extension-loading.md`) — consult them when needed; nothing here mirrors
+them.
 
-## Rules
+## Conventions
 
-- Extensions target the **installed** `omp` binary's API, not upstream npm
-  packages — the install refuses `omp update`, so upstream may drift. Check
-  the installed binary's actual surface before using an API.
-- One extension per directory; keep extensions self-contained: no
-  cross-extension imports, no runtime assumptions beyond `ExtensionAPI`
-  (`@oh-my-pi/pi-coding-agent`).
-- TypeScript throughout; Bun runtime. Follow the parent repo's code-quality
-  rules for code written here: no `any`, no inline imports, Bun APIs over
-  `node:*` where cleaner, `logger` (never `console.*`) in extension code.
+This repo owns its conventions independently. Keep them light:
+
+- TypeScript, Bun runtime. Extensions are plain modules — no build step, no
+  bundler.
+- Extensions are self-contained: one directory each, no cross-extension
+  imports, no assumptions beyond the `ExtensionAPI` passed to the factory.
+- Target the installed `omp` binary's API surface, not upstream npm packages;
+  verify against the installed binary when in doubt.
+- Inside extension runtime code use the provided `logger`, never `console.*`
+  (it corrupts the TUI/protocols the host may be running).
