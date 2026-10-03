@@ -807,6 +807,7 @@ export class CompanionController {
 
 	/** Re-run the clean boundary when the omp session id changes (/new, branch, resume). */
 	async onSessionChanged(newSessionId: string): Promise<void> {
+		if (this.#shutdownStarted) return; // shutdown owns the companion from here on
 		if (this.#ompSessionId === newSessionId) return;
 		this.#ompSessionId = newSessionId;
 		this.#viewToken = undefined;

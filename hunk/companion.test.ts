@@ -349,6 +349,20 @@ describe("companion identity and lifecycle", () => {
 		expect(ctx.controller.state).toBe("ready");
 	});
 
+	test("session changes during shutdown do not reset the companion", async () => {
+		const ctx = await freshContext();
+		cleaners.push(ctx.cleanup);
+		await ctx.controller.initialize();
+		expect(ctx.harness.clears).toBe(1);
+
+		const shutdown = ctx.controller.shutdown(1_000);
+		await ctx.controller.onSessionChanged("omp-during-shutdown");
+		await shutdown;
+
+		expect(ctx.harness.clears).toBe(1);
+		expect(ctx.controller.state).toBe("unavailable");
+	});
+
 	test("scope change retitles the tab to diff without affecting the reload", async () => {
 		const ctx = await freshContext();
 		cleaners.push(ctx.cleanup);
