@@ -7,23 +7,35 @@
  *   terminal metadata}; it exposes no herdr pane ids. Label matching and
  *   repo-only matching are therefore NOT identity proofs. The proof is a PID
  *   intersection: the registered Hunk session PID must appear in the owned
- *   pane's foreground processes.
+ *   pane's foreground processes, the pane's shell PID must match the record,
+ *   and a bind may only claim sessions that are new relative to the
+ *   launch-time registry snapshot.
  * - The persistent ownership record (keyed by herdr socket + workspace) proves
  *   which tab/pane this extension created. It stores no notes and is never a
  *   replay journal.
+ *
+ * Failure policy: herdr calls distinguish proven absence (structured
+ * tab_not_found/pane_not_found codes) from indeterminate failures (socket
+ * hiccups, herdr restarts, timeouts, malformed output). Absence may close or
+ * relaunch; indeterminate failures skip the tick or park the controller in
+ * "unavailable" for retry — never a sticky close, never a duplicate tab.
+ * Handshake ambiguity (several candidate sessions) fails closed everywhere;
+ * the documented recovery is closing the stuck tab and completing a /diff
+ * selection.
  */
 
-import * as nodeFs from "node:fs/promises";
 import {
+	CommandCliError,
 	CompanionUnavailable,
 	HunkCli,
-	HunkCliError,
 	type CommentAddRequest,
 	type CommentAddResult,
-	type ExecRunner,
+	type RegisteredSession,
 	type ReviewPublication,
 	type SessionSnapshot,
 } from "./hunk-cli";
+import { HerdrAbsentError, HerdrCli, type HerdrPane, type PaneProcessInfo } from "./herdr-cli";
+import { canonicalPath } from "./boundary";
 import {
 	hunkReloadArgs,
 	resolveCheckout,
@@ -78,7 +90,31 @@ export type CompanionState = "unavailable" | "starting" | "ready" | "closed";
 
 export type ClosedReason = "user" | "exited" | "blocked" | "left-git" | "unverified";
 
-const STICKY_CLOSED: ReadonlySet<ClosedReason> = new Set(["user", "exited", "unverified"]);
+/**
+ * What each closed reason permits. `sticky` blocks non-explicit reopen
+ * (initialize without a completed /diff); `autoRecover` lets the lifecycle
+ * tick retry startup on its own (left-git only: re-entering a repo is not a
+ * user decision to close).
+ */
+const CLOSED_POLICY: Record<ClosedReason, { sticky: boolean; autoRecover: boolean }> = {
+	user: { sticky: true, autoRecover: false },
+	exited: { sticky: true, autoRecover: false },
+	unverified: { sticky: true, autoRecover: false },
+	blocked: { sticky: true, autoRecover: false },
+	"left-git": { sticky: false, autoRecover: true },
+};
+
+type Presence = "present" | "absent" | "indeterminate";
+
+type HandshakeOutcome =
+	| { status: "bound"; hunkSessionId: string; hunkPid: number }
+	| { status: "ambiguous"; reason: string }
+	| { status: "timeout" };
+
+type HealthOutcome =
+	| "healthy"
+	| "indeterminate"
+	| { reason: ClosedReason; notifyKey: string; notice: string };
 
 interface ViewTokenRecord {
 	token: string;
@@ -141,34 +177,22 @@ function shellQuote(value: string): string {
 	return `'${value.replaceAll("'", `'\\''`)}'`;
 }
 
-/** Boundary guard for external JSON objects (herdr envelopes, CLI payloads). */
-function asRecord(value: unknown): Record<string, unknown> | null {
-	if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
-	return value as Record<string, unknown>;
-}
-
-async function canonicalPath(path: string): Promise<string> {
-	try {
-		return await nodeFs.realpath(path);
-	} catch {
-		return path;
-	}
-}
-
-interface PaneProcessInfo {
-	shellPid?: number;
-	foregroundPids: number[];
-}
-
-interface HerdrPane {
-	paneId: string;
-	tabId?: string;
-	workspaceId?: string;
+/**
+ * Idle means no foreground process — or only the pane's own shell, which herdr
+ * may keep reporting after the foreground job exits. Every occupied/idle
+ * decision in the controller goes through this predicate so an owned occupant
+ * is never mistaken for a foreign one (and vice versa).
+ */
+function isIdleShell(info: PaneProcessInfo, shellPid: number | undefined): boolean {
+	if (info.foregroundPids.length === 0) return true;
+	if (shellPid === undefined) return false;
+	return info.foregroundPids.every(pid => pid === shellPid);
 }
 
 export class CompanionController {
 	readonly #deps: CompanionDeps;
 	readonly #cli: HunkCli;
+	readonly #herdr: HerdrCli;
 	#state: CompanionState = "unavailable";
 	#closedReason: ClosedReason | undefined;
 	#binding: { hunkSessionId: string; hunkPid?: number } | undefined;
@@ -184,18 +208,21 @@ export class CompanionController {
 	#viewToken: ViewTokenRecord | undefined;
 	#queueTail: Promise<unknown> = Promise.resolve();
 	#initPromise: Promise<void> | undefined;
+	/** Hunk registry snapshot taken before the current launch submitted its command. */
+	#launchBeforeSessions: Set<string> | undefined;
 	#resetFailed = false;
 	#shutdownStarted = false;
-	#lifecycleTickRunning = false;
-	#archiveTickRunning = false;
+	/** In-flight lifecycle tick; concurrent callers await it instead of racing. */
+	#lifecycleTickPromise: Promise<void> | undefined;
+	#archiveRunning = false;
 	#launchInFlight = false;
-	#readinessPollHandle: unknown;
 	#lastNotifyKey: string | undefined;
 	readonly #eligible: boolean;
 
 	constructor(deps: CompanionDeps) {
 		this.#deps = deps;
 		this.#cli = new HunkCli(deps.exec, deps.hunkPath);
+		this.#herdr = new HerdrCli(deps.exec, deps.env.HERDR_BIN_PATH ?? "herdr");
 		this.#eligible = eligibleEnv(deps.env);
 	}
 
@@ -227,14 +254,6 @@ export class CompanionController {
 		return this.#baselineHead;
 	}
 
-	get annotationsAvailable(): boolean {
-		return this.isReady && !this.#resetFailed;
-	}
-
-	#herdrPath(): string {
-		return this.#deps.env.HERDR_BIN_PATH ?? "herdr";
-	}
-
 	#workspaceId(): string {
 		return this.#deps.env.HERDR_WORKSPACE_ID ?? "";
 	}
@@ -249,7 +268,12 @@ export class CompanionController {
 		}
 	}
 
-	#notifyOnce(key: string, message: string, level: NotifyLevel): void {
+	/**
+	 * Consecutive-duplicate suppression: fires only when `key` differs from the
+	 * previous notification. Recovery paths clear the matching key so a
+	 * recurrence of the same failure notifies again instead of staying silent.
+	 */
+	#notifyOnChange(key: string, message: string, level: NotifyLevel): void {
 		if (this.#lastNotifyKey === key) return;
 		this.#lastNotifyKey = key;
 		this.#deps.notify(message, level);
@@ -299,119 +323,50 @@ export class CompanionController {
 
 	// ---------------------------------------------------------------- herdr --
 
-	async #herdr(args: string[], context: string, timeoutMs = 5_000): Promise<Record<string, unknown>> {
-		const outcome = await this.#deps.exec(this.#herdrPath(), args, { timeoutMs });
-		if (outcome.code !== 0 || outcome.killed) {
-			const detail = outcome.stderr.trim() || outcome.stdout.trim();
-			throw new HunkCliError(`${context}: ${detail || "herdr call failed"}`, outcome.code, detail);
-		}
-		let parsed: unknown;
+	async #tabPresence(tabId: string): Promise<Presence> {
 		try {
-			parsed = JSON.parse(outcome.stdout);
-		} catch {
-			throw new HunkCliError(`${context}: herdr returned malformed JSON`, 0, outcome.stdout.slice(0, 400));
+			return await this.#herdr.tabPresence(tabId);
+		} catch (error) {
+			this.#deps.logger.debug("herdr tab get failed", { tabId, error });
+			return "indeterminate";
 		}
-		const envelope = asRecord(parsed);
-		if (!envelope) {
-			throw new HunkCliError(`${context}: herdr returned an unexpected payload`, 0, "");
-		}
-		const result = asRecord(envelope["result"]);
-		if (!result) {
-			throw new HunkCliError(`${context}: herdr response missing result`, 0, "");
-		}
-		return result;
 	}
 
-	async #tabExists(tabId: string): Promise<boolean> {
+	async #paneState(paneId: string): Promise<HerdrPane | "absent" | "indeterminate"> {
 		try {
-			await this.#herdr(["tab", "get", tabId], "tab get");
-			return true;
-		} catch {
-			return false;
+			return (await this.#herdr.paneState(paneId)) ?? "absent";
+		} catch (error) {
+			this.#deps.logger.debug("herdr pane get failed", { paneId, error });
+			return "indeterminate";
 		}
 	}
 
-	async #paneProcessInfo(paneId: string): Promise<PaneProcessInfo> {
-		const result = await this.#herdr(["pane", "process-info", "--pane", paneId], "pane process-info");
-		const info = result["process_info"];
-		const record = asRecord(info);
-		if (!record) {
-			throw new HunkCliError("pane process-info: malformed response", 0, "");
-		}
-		const foreground: number[] = [];
-		if (Array.isArray(record["foreground_processes"])) {
-			for (const entry of record["foreground_processes"]) {
-				const process = asRecord(entry);
-				const pid = process?.["pid"];
-				if (typeof pid === "number" && Number.isInteger(pid)) foreground.push(pid);
-			}
-		}
-		const shellPidValue = record["shell_pid"];
-		const shellPid =
-			typeof shellPidValue === "number" && Number.isInteger(shellPidValue) ? shellPidValue : undefined;
-		return { shellPid, foregroundPids: foreground };
-	}
-
-	async #paneGet(paneId: string): Promise<HerdrPane | null> {
+	async #paneInfo(paneId: string): Promise<PaneProcessInfo | "absent" | "indeterminate"> {
 		try {
-			const result = await this.#herdr(["pane", "get", paneId], "pane get");
-			const pane = asRecord(result["pane"]);
-			if (!pane) return null;
-			const paneIdValue = pane["pane_id"];
-			if (typeof paneIdValue !== "string") return null;
-			const tabId = pane["tab_id"];
-			const workspaceId = pane["workspace_id"];
-			return {
-				paneId: paneIdValue,
-				tabId: typeof tabId === "string" ? tabId : undefined,
-				workspaceId: typeof workspaceId === "string" ? workspaceId : undefined,
-			};
-		} catch {
-			return null;
+			return await this.#herdr.paneProcessInfo(paneId);
+		} catch (error) {
+			if (error instanceof HerdrAbsentError) return "absent";
+			this.#deps.logger.debug("herdr pane process-info failed", { paneId, error });
+			return "indeterminate";
 		}
 	}
 
-	async #tabCreate(repoRoot: string): Promise<{ tabId: string; paneId: string }> {
-		const args = [
-			"tab",
-			"create",
-			"--workspace",
-			this.#workspaceId(),
-			"--cwd",
-			repoRoot,
-			"--label",
-			"hunk",
-			"--no-focus",
-		];
+	/**
+	 * Broker host/port must be pinned at tab creation; omp-side environment
+	 * changes do not propagate into already-created herdr tabs.
+	 */
+	#tabCreateEnvArgs(): string[] {
+		const envArgs: string[] = [];
 		const host = this.#deps.env.HUNK_MCP_HOST;
 		const port = this.#deps.env.HUNK_MCP_PORT;
-		if (host !== undefined && host.length > 0) args.push("--env", `HUNK_MCP_HOST=${host}`);
-		if (port !== undefined && port.length > 0) args.push("--env", `HUNK_MCP_PORT=${port}`);
-		const result = await this.#herdr(args, "tab create", 10_000);
-		const tab = asRecord(result["tab"]);
-		const rootPane = asRecord(result["root_pane"]);
-		if (!tab || !rootPane) {
-			throw new HunkCliError("tab create: malformed response", 0, "");
-		}
-		const tabId = tab["tab_id"];
-		const paneId = rootPane["pane_id"];
-		if (typeof tabId !== "string" || typeof paneId !== "string") {
-			throw new HunkCliError("tab create: missing tab/pane ids", 0, "");
-		}
-		return { tabId, paneId };
-	}
-
-	async #paneRun(paneId: string, command: string): Promise<void> {
-		await this.#herdr(["pane", "run", paneId, command], "pane run");
-	}
-
-	async #sendCtrlC(paneId: string): Promise<void> {
-		await this.#herdr(["pane", "send-keys", paneId, "ctrl+c"], "pane send-keys");
+		if (host !== undefined && host.length > 0) envArgs.push("--env", `HUNK_MCP_HOST=${host}`);
+		if (port !== undefined && port.length > 0) envArgs.push("--env", `HUNK_MCP_PORT=${port}`);
+		return envArgs;
 	}
 
 	async focusTab(): Promise<void> {
 		if (!this.#record) throw new CompanionUnavailable("No companion tab to focus.");
-		await this.#herdr(["tab", "focus", this.#record.tabId], "tab focus");
+		await this.#herdr.run(["tab", "focus", this.#record.tabId], "tab focus");
 	}
 
 	/**
@@ -420,7 +375,7 @@ export class CompanionController {
 	 */
 	async renameTab(label: string): Promise<void> {
 		if (!this.#record) throw new CompanionUnavailable("No companion tab to rename.");
-		await this.#herdr(["tab", "rename", this.#record.tabId, label], "tab rename");
+		await this.#herdr.run(["tab", "rename", this.#record.tabId, label], "tab rename");
 	}
 
 	// ------------------------------------------------------------- lifecycle --
@@ -434,13 +389,9 @@ export class CompanionController {
 	initialize(options?: { explicit?: boolean }): Promise<void> {
 		if (this.#state === "ready") return Promise.resolve();
 		if (this.#initPromise) return this.#initPromise;
-		this.#initPromise = this.enqueue(() => this.#initializeInner(options))
-			.catch(error => {
-				throw error;
-			})
-			.finally(() => {
-				this.#initPromise = undefined;
-			});
+		this.#initPromise = this.enqueue(() => this.#initializeInner(options)).finally(() => {
+			this.#initPromise = undefined;
+		});
 		return this.#initPromise;
 	}
 
@@ -457,7 +408,7 @@ export class CompanionController {
 		}
 		if (
 			this.#state === "closed" &&
-			STICKY_CLOSED.has(this.#closedReason ?? "user") &&
+			CLOSED_POLICY[this.#closedReason ?? "user"].sticky &&
 			options?.explicit !== true
 		) {
 			throw new CompanionUnavailable("Open /diff to reopen the Hunk companion.");
@@ -467,7 +418,11 @@ export class CompanionController {
 		try {
 			record = await readCompanionRecord(this.#recordFile());
 		} catch (error) {
-			this.#deps.notify("Hunk: companion ownership record is malformed; leaving it untouched.", "error");
+			this.#notifyOnChange(
+				"record-malformed",
+				"Hunk: companion ownership record is malformed; leaving it untouched.",
+				"error",
+			);
 			this.#deps.logger.error("companion record malformed", { path: this.#recordFile(), error });
 			throw new CompanionUnavailable("Hunk companion ownership record is malformed.");
 		}
@@ -477,26 +432,45 @@ export class CompanionController {
 		this.#state = "starting";
 		this.#closedReason = undefined;
 
-		if (record !== null && record.socketPath === (this.#deps.env.HERDR_SOCKET_PATH ?? "")) {
-			if (record.ownerPaneId !== this.#agentPaneId()) {
-				const ownerPane = await this.#paneGet(record.ownerPaneId);
-				if (ownerPane !== null) {
-					this.#state = "unavailable";
-					this.#notifyOnce(
-						"ownership-conflict",
-						`Hunk companion is owned by another agent pane (${record.ownerPaneId}).`,
-						"warning",
-					);
-					throw new CompanionUnavailable(
-						`Hunk companion is owned by another agent pane (${record.ownerPaneId}).`,
-					);
+		try {
+			if (record !== null && record.socketPath === (this.#deps.env.HERDR_SOCKET_PATH ?? "")) {
+				if (record.ownerPaneId !== this.#agentPaneId()) {
+					const ownerPane = await this.#paneState(record.ownerPaneId);
+					if (ownerPane === "indeterminate") {
+						throw new CompanionUnavailable(
+							"Hunk: could not reach herdr to verify the companion owner; will retry.",
+						);
+					}
+					if (ownerPane !== "absent") {
+						this.#state = "unavailable";
+						this.#notifyOnChange(
+							"ownership-conflict",
+							`Hunk companion is owned by another agent pane (${record.ownerPaneId}).`,
+							"warning",
+						);
+						throw new CompanionUnavailable(
+							`Hunk companion is owned by another agent pane (${record.ownerPaneId}).`,
+						);
+					}
+					// Owner pane is verifiably gone: take over after the identity checks below.
 				}
-				// Owner pane is gone: take over after full identity checks below.
+				if (await this.#adoptOrLaunchFromRecord(record, checkout.repoRoot, checkout.headSha, options?.explicit === true)) return;
 			}
-			const adopted = await this.#adoptOrLaunchFromRecord(record, checkout.repoRoot, checkout.headSha);
-			if (adopted) return;
+			await this.#launchNewTab(checkout.repoRoot, checkout.headSha);
+		} catch (error) {
+			// A startup that failed before producing a bound companion must not
+			// wedge in "starting" (tools would claim "still starting" forever and
+			// ticks would no-op). Park it: lifecycle ticks retry, tools report
+			// honestly. Deliberate closes (blocked/unverified) stay untouched.
+			if (this.#state === "starting") this.#markRetryable();
+			throw error;
 		}
-		await this.#launchNewTab(checkout.repoRoot, checkout.headSha);
+	}
+
+	/** Startup failed without a closed decision: retryable by ticks and /diff. */
+	#markRetryable(): void {
+		this.#state = "unavailable";
+		this.#closedReason = undefined;
 	}
 
 	/** Returns true when the existing record produced a bound companion. */
@@ -504,88 +478,197 @@ export class CompanionController {
 		record: CompanionRecord,
 		repoRoot: string,
 		headSha: string,
+		explicit = false,
 	): Promise<boolean> {
 		// Bind paths below seed scope and persistence from these fields; the
 		// root-change fallback calls this method outside #initializeInner, so
 		// they must track the caller's target checkout, not the previous root.
 		this.#repoRoot = repoRoot;
 		this.#baselineHead = headSha;
-		if (!(await this.#tabExists(record.tabId))) {
+
+		const tab = await this.#tabPresence(record.tabId);
+		if (tab === "indeterminate") {
+			throw new CompanionUnavailable("Hunk: could not reach herdr to verify the companion tab; will retry.");
+		}
+		if (tab === "absent") {
 			// A previous session's closed tab does not bind a fresh session: relaunch.
 			this.#deps.logger.debug("recorded companion tab is gone; creating a new one", { tabId: record.tabId });
 			return false;
 		}
-		const pane = await this.#paneGet(record.paneId);
-		if (pane === null || (pane.tabId !== undefined && pane.tabId !== record.tabId)) {
+		const pane = await this.#paneState(record.paneId);
+		if (pane === "indeterminate") {
+			throw new CompanionUnavailable("Hunk: could not reach herdr to verify the companion pane; will retry.");
+		}
+		if (pane === "absent" || (pane.tabId !== undefined && pane.tabId !== record.tabId)) {
 			this.#deps.logger.debug("recorded companion pane is gone; creating a new one", { paneId: record.paneId });
 			return false;
 		}
-		const info = await this.#paneProcessInfo(record.paneId);
+		const info = await this.#paneInfo(record.paneId);
+		if (info === "indeterminate") {
+			throw new CompanionUnavailable("Hunk: could not reach herdr to inspect the companion pane; will retry.");
+		}
+		if (info === "absent") {
+			// Pane vanished between the two herdr calls; treat like a gone pane.
+			this.#deps.logger.debug("recorded companion pane vanished during adoption", { paneId: record.paneId });
+			return false;
+		}
+		if (
+			(record.hunkSessionId !== undefined || record.shellPid !== undefined) &&
+			(record.shellPid === undefined || info.shellPid !== record.shellPid)
+		) {
+			if (explicit) return false;
+			this.#closeWithReason("unverified");
+			throw new CompanionUnavailable("Hunk companion shell was replaced; use /diff to open a new tab.");
+		}
 
 		if (record.hunkSessionId !== undefined && record.hunkPid !== undefined) {
-			const sessions = await this.#cli.sessionList();
-			const registered = sessions.find(entry => entry.sessionId === record.hunkSessionId);
-			const registeredRoot =
-				registered !== undefined ? await canonicalPath(registered.repoRoot ?? registered.cwd) : undefined;
-			if (
-				registered !== undefined &&
-				registered.pid === record.hunkPid &&
-				info.foregroundPids.includes(record.hunkPid) &&
-				registeredRoot === repoRoot
-			) {
-				this.#record = { ...record, repoRoot, ownerPaneId: this.#agentPaneId() };
-				await this.#finishBind(
-					{ hunkSessionId: record.hunkSessionId, hunkPid: record.hunkPid },
-					{ reloadToSessionScope: true },
-				);
-				return true;
-			}
-			// PID survives but the daemon lost the recorded id: re-resolve by pid.
-			const byPid = sessions.filter(entry => entry.pid === record.hunkPid);
-			const inPane = [];
-			for (const entry of byPid) {
-				if (!info.foregroundPids.includes(entry.pid)) continue;
-				const entryRoot = await canonicalPath(entry.repoRoot ?? entry.cwd);
-				if (entryRoot === repoRoot) inPane.push(entry);
-			}
-			if (inPane.length === 1) {
-				const session = inPane[0];
-				this.#record = {
-					...record,
-					repoRoot,
-					hunkSessionId: session.sessionId,
-					ownerPaneId: this.#agentPaneId(),
-				};
-				await this.#persistRecord();
-				await this.#finishBind(
-					{ hunkSessionId: session.sessionId, hunkPid: record.hunkPid },
-					{ reloadToSessionScope: true },
-				);
-				return true;
-			}
-			if (inPane.length > 1) {
-				this.#closeWithReason("unverified");
-				this.#notifyOnce(
-					"unverified",
-					"Hunk: could not identify the companion session uniquely; use /diff to relaunch.",
-					"error",
-				);
-				throw new CompanionUnavailable("Hunk companion session could not be identified.");
-			}
-			// Recorded hunk is gone. An idle pane may be reused; an occupied one is left alone.
-			if (info.foregroundPids.length > 0) {
-				return false; // fall through to a brand-new tab; never touch the occupant.
-			}
-			const shellMatches = record.shellPid === undefined || info.shellPid === record.shellPid;
-			if (!shellMatches) return false;
+			return this.#bindRecordedSession(
+				record,
+				{ hunkSessionId: record.hunkSessionId, hunkPid: record.hunkPid },
+				repoRoot,
+				headSha,
+				info,
+				explicit,
+			);
+		}
+		return this.#recoverIncompleteLaunch(record, repoRoot, headSha, info, explicit);
+	}
+
+	/** Recorded session binding: re-verify, re-resolve by pid, or fail closed. */
+	async #bindRecordedSession(
+		record: CompanionRecord,
+		binding: { hunkSessionId: string; hunkPid: number },
+		repoRoot: string,
+		headSha: string,
+		info: PaneProcessInfo,
+		explicit: boolean,
+	): Promise<boolean> {
+		const sessions = await this.#cli.sessionList();
+		const registered = sessions.find(entry => entry.sessionId === binding.hunkSessionId);
+		const registeredRoot =
+			registered !== undefined ? await canonicalPath(registered.repoRoot ?? registered.cwd) : undefined;
+		if (
+			registered !== undefined &&
+			registered.pid === binding.hunkPid &&
+			info.foregroundPids.includes(binding.hunkPid) &&
+			registeredRoot === repoRoot
+		) {
+			this.#record = { ...record, repoRoot, ownerPaneId: this.#agentPaneId() };
+			await this.#finishBind(binding, { reloadToSessionScope: true });
+			return true;
+		}
+		// PID survives but the daemon lost the recorded id: re-resolve by pid.
+		const inPane = [];
+		for (const entry of sessions) {
+			if (entry.pid !== binding.hunkPid) continue;
+			if (!info.foregroundPids.includes(entry.pid)) continue;
+			const entryRoot = await canonicalPath(entry.repoRoot ?? entry.cwd);
+			if (entryRoot === repoRoot) inPane.push(entry);
+		}
+		if (inPane.length === 1) {
+			const session = inPane[0];
+			this.#record = {
+				...record,
+				repoRoot,
+				hunkSessionId: session.sessionId,
+				ownerPaneId: this.#agentPaneId(),
+			};
+			await this.#persistRecord();
+			await this.#finishBind(
+				{ hunkSessionId: session.sessionId, hunkPid: binding.hunkPid },
+				{ reloadToSessionScope: true },
+			);
+			return true;
+		}
+		if (inPane.length > 1) {
+			this.#failClosedAmbiguity(
+				"unverified",
+				"multiple sessions match the recorded pid in the owned pane",
+				"Hunk: could not identify the companion session uniquely. Close the companion tab, then use /diff to relaunch.",
+			);
+		}
+		if (explicit && !isIdleShell(info, record.shellPid)) return false;
+		// The recorded hunk may still occupy the pane at another root (left-git
+		// re-entry, cross-worktree restart): stop it and relaunch in place
+		// instead of orphaning it in favor of a second tab.
+		if (await this.#stopRecordedOccupant(record, binding, info, sessions)) {
 			await this.#launchInPane(record.tabId, record.paneId, repoRoot, headSha, info);
 			return true;
 		}
+		// Occupied by something the record cannot prove is ours: leave it alone.
+		if (!isIdleShell(info, record.shellPid)) {
+			if (explicit) return false;
+			this.#closeWithReason("blocked");
+			this.#notifyOnChange(
+				"occupied-pane",
+				"Hunk: the companion pane is busy with an unrecognized process; it was left untouched. Use /diff to open a new tab.",
+				"warning",
+			);
+			throw new CompanionUnavailable("Hunk companion pane is occupied by an unrecognized process. Use /diff to open a new tab.");
+		}
+		const shellMatches = record.shellPid === undefined || info.shellPid === record.shellPid;
+		if (!shellMatches) {
+			this.#deps.logger.debug("recorded pane shell was replaced; creating a new tab", {
+				paneId: record.paneId,
+			});
+			return false;
+		}
+		await this.#launchInPane(record.tabId, record.paneId, repoRoot, headSha, info);
+		return true;
+	}
 
-		// Incomplete launch from a previous session: try a short late bind before
-		// deciding the pane is unusable — the review may have registered late.
-		const lateBind = await this.#handshake(record.paneId, repoRoot, new Set<string>(), 2_000);
-		if (lateBind !== null && !("error" in lateBind)) {
+	/**
+	 * Single ambiguity policy for the identity handshake: never guess, never
+	 * relaunch into the pane. The tab stands closed; the documented recovery is
+	 * closing the stuck tab and completing a /diff selection.
+	 */
+	#failClosedAmbiguity(notifyKey: string, detail: string, message: string): never {
+		this.#deps.logger.debug("handshake ambiguous; failing closed", { detail });
+		this.#closeWithReason("unverified");
+		this.#notifyOnChange(notifyKey, message, "error");
+		throw new CompanionUnavailable(message);
+	}
+
+	/**
+	 * True when the recorded hunk still occupies the pane (possibly registered
+	 * at another root) and was stopped for an in-place relaunch. Requires the
+	 * registry to still know the pid — foreground presence alone could be pid
+	 * reuse by an unrelated process.
+	 */
+	async #stopRecordedOccupant(
+		record: CompanionRecord,
+		binding: { hunkSessionId: string; hunkPid: number },
+		info: PaneProcessInfo,
+		sessions: RegisteredSession[],
+	): Promise<boolean> {
+		if (!info.foregroundPids.includes(binding.hunkPid)) return false;
+		if (!sessions.some(entry => entry.pid === binding.hunkPid)) return false;
+		if (record.shellPid === undefined || info.shellPid !== record.shellPid) {
+			return false;
+		}
+		return this.#stopOwnedHunk(record.paneId, record.shellPid);
+	}
+
+	/**
+	 * Record exists but never captured a hunk identity (launch interrupted).
+	 * Try a short late bind — the review may have registered late — then decide
+	 * between an in-place relaunch and fail-closed reporting.
+	 */
+	async #recoverIncompleteLaunch(
+		record: CompanionRecord,
+		repoRoot: string,
+		headSha: string,
+		info: PaneProcessInfo,
+		explicit: boolean,
+	): Promise<boolean> {
+		const lateBind = await this.#handshake(
+			record.paneId,
+			repoRoot,
+			this.#launchBeforeSessions ?? new Set<string>(),
+			record.shellPid,
+			2_000,
+		);
+		if (lateBind.status === "bound") {
 			this.#record = {
 				...record,
 				repoRoot,
@@ -597,24 +680,42 @@ export class CompanionController {
 			await this.#finishBind(lateBind, { reloadToSessionScope: true });
 			return true;
 		}
-		if (info.foregroundPids.length > 0) {
-			this.#closeWithReason("blocked");
-			this.#notifyOnce(
+		if (lateBind.status === "ambiguous") {
+			this.#failClosedAmbiguity(
 				"incomplete-launch",
-				"Hunk: previous companion launch never completed and the pane is busy; use /diff to open a new tab.",
+				lateBind.reason,
+				"Hunk: could not identify the review session in the companion pane. Close the tab, then use /diff to relaunch.",
+			);
+		}
+		if (!isIdleShell(info, record.shellPid)) {
+			if (explicit) return false;
+			this.#closeWithReason("blocked");
+			this.#notifyOnChange(
+				"incomplete-launch",
+				"Hunk: the previous launch never completed and the companion pane is busy; it was left untouched. Use /diff to open a new tab.",
 				"warning",
 			);
 			throw new CompanionUnavailable("Hunk companion launch was incomplete and the pane is occupied.");
 		}
 		const shellMatches = record.shellPid === undefined || info.shellPid === record.shellPid;
-		if (!shellMatches) return false;
+		if (!shellMatches) {
+			this.#deps.logger.debug("recorded pane shell was replaced; creating a new tab", {
+				paneId: record.paneId,
+			});
+			return false;
+		}
 		await this.#launchInPane(record.tabId, record.paneId, repoRoot, headSha, info);
 		return true;
 	}
 
 	async #launchNewTab(repoRoot: string, headSha: string): Promise<void> {
 		const before = new Set((await this.#cli.sessionList()).map(entry => entry.sessionId));
-		const { tabId, paneId } = await this.#tabCreate(repoRoot);
+		this.#launchBeforeSessions = before;
+		const { tabId, paneId } = await this.#herdr.tabCreate(
+			this.#workspaceId(),
+			repoRoot,
+			this.#tabCreateEnvArgs(),
+		);
 		this.#record = {
 			version: 1,
 			socketPath: this.#deps.env.HERDR_SOCKET_PATH ?? "",
@@ -628,7 +729,7 @@ export class CompanionController {
 		const info = await this.#waitForShell(paneId);
 		if (info === null) {
 			// Provisional record stands; late lifecycle ticks may still bind.
-			this.#notifyOnce(
+			this.#notifyOnChange(
 				"shell-timeout",
 				"Hunk: companion tab shell did not become ready in time.",
 				"warning",
@@ -641,12 +742,10 @@ export class CompanionController {
 	async #waitForShell(paneId: string, deadlineMs = 10_000): Promise<PaneProcessInfo | null> {
 		const startedAt = this.#deps.timers.now();
 		for (;;) {
-			try {
-				const info = await this.#paneProcessInfo(paneId);
-				if (info.shellPid !== undefined) return info;
-			} catch (error) {
-				this.#deps.logger.debug("pane process-info not ready yet", { paneId, error });
-			}
+			if (this.#shutdownStarted) return null;
+			const info = await this.#paneInfo(paneId);
+			if (info === "absent") return null; // tab closed mid-launch; the next tick reports it
+			if (info !== "indeterminate" && info.shellPid !== undefined) return info;
 			if (this.#deps.timers.now() - startedAt >= deadlineMs) return null;
 			await this.#sleep(250);
 		}
@@ -660,10 +759,13 @@ export class CompanionController {
 		info: PaneProcessInfo,
 		beforeSessions?: Set<string>,
 	): Promise<void> {
-		this.#repoRoot = repoRoot;
-		this.#baselineHead = headSha;
+		if (this.#launchInFlight) {
+			throw new CompanionUnavailable("Hunk companion launch already in flight.");
+		}
 		this.#launchInFlight = true;
 		try {
+			this.#repoRoot = repoRoot;
+			this.#baselineHead = headSha;
 			await this.#launchInPaneInner(tabId, paneId, repoRoot, headSha, info, beforeSessions);
 		} finally {
 			this.#launchInFlight = false;
@@ -687,21 +789,24 @@ export class CompanionController {
 		}
 		const before =
 			beforeSessions ?? new Set((await this.#cli.sessionList()).map(entry => entry.sessionId));
+		this.#launchBeforeSessions = before;
 		const command = `cd -- ${shellQuote(repoRoot)} && ${shellQuote(this.#deps.hunkPath)} diff ${shellQuote(headSha)} --watch --agent-notes`;
-		await this.#paneRun(paneId, command);
+		await this.#herdr.run(["pane", "run", paneId, command], "pane run");
 		this.#state = "starting";
-		const handshake = await this.#handshake(paneId, repoRoot, before, 20_000);
-		if (handshake === null) {
-			this.#notifyOnce(
+		const handshake = await this.#handshake(paneId, repoRoot, before, info.shellPid, 20_000);
+		if (handshake.status === "ambiguous") {
+			this.#failClosedAmbiguity(
+				"handshake-ambiguous",
+				handshake.reason,
+				"Hunk: multiple review sessions appeared in the companion pane. Close the tab, then use /diff to relaunch.",
+			);
+		}
+		if (handshake.status === "timeout") {
+			this.#notifyOnChange(
 				"launch-timeout",
 				"Hunk: review not ready yet (timed out); it may still be loading.",
 				"warning",
 			);
-			return;
-		}
-		if ("error" in handshake) {
-			this.#closeWithReason("unverified");
-			this.#notifyOnce("handshake-ambiguous", handshake.error, "error");
 			return;
 		}
 		this.#record = {
@@ -728,35 +833,54 @@ export class CompanionController {
 		);
 	}
 
+	/**
+	 * Poll the owned pane until exactly one newly-registered hunk session (not
+	 * in `before`, in the pane's foreground, at the expected canonical root)
+	 * proves itself. `expectedShellPid` must still own the pane: a replaced
+	 * shell means whatever runs there was not started by our command. Timeout
+	 * means "nothing proven yet" and stays retryable by design; ambiguity is
+	 * final and fails closed at every call site.
+	 */
 	async #handshake(
 		paneId: string,
 		expectedRoot: string,
 		before: Set<string>,
+		expectedShellPid: number | undefined,
 		deadlineMs: number,
-	): Promise<{ hunkSessionId: string; hunkPid: number } | { error: string } | null> {
+	): Promise<HandshakeOutcome> {
 		const startedAt = this.#deps.timers.now();
 		for (;;) {
-			try {
-				const info = await this.#paneProcessInfo(paneId);
-				const sessions = await this.#cli.sessionList();
-				const candidates = [];
-				for (const entry of sessions) {
-					if (before.has(entry.sessionId)) continue;
-					if (!info.foregroundPids.includes(entry.pid)) continue;
-					const entryRoot = await canonicalPath(entry.repoRoot ?? entry.cwd);
-					if (entryRoot === expectedRoot) candidates.push(entry);
+			if (this.#shutdownStarted) return { status: "timeout" };
+			const info = await this.#paneInfo(paneId);
+			if (info !== "indeterminate") {
+				if (info === "absent") return { status: "timeout" };
+				if (expectedShellPid !== undefined && info.shellPid !== expectedShellPid) {
+					return { status: "timeout" };
 				}
-				if (candidates.length === 1) {
-					const session = candidates[0];
-					return { hunkSessionId: session.sessionId, hunkPid: session.pid };
+				try {
+					const sessions = await this.#cli.sessionList();
+					const candidates = [];
+					for (const entry of sessions) {
+						if (before.has(entry.sessionId)) continue;
+						if (!info.foregroundPids.includes(entry.pid)) continue;
+						const entryRoot = await canonicalPath(entry.repoRoot ?? entry.cwd);
+						if (entryRoot === expectedRoot) candidates.push(entry);
+					}
+					if (candidates.length === 1) {
+						const session = candidates[0];
+						return { status: "bound", hunkSessionId: session.sessionId, hunkPid: session.pid };
+					}
+					if (candidates.length > 1) {
+						return {
+							status: "ambiguous",
+							reason: "multiple new review sessions appeared in the owned pane",
+						};
+					}
+				} catch (error) {
+					this.#deps.logger.debug("handshake poll failed", { paneId, error });
 				}
-				if (candidates.length > 1) {
-					return { error: "Hunk: multiple new review sessions appeared; refusing to guess." };
-				}
-			} catch (error) {
-				this.#deps.logger.debug("handshake poll failed", { paneId, error });
 			}
-			if (this.#deps.timers.now() - startedAt >= deadlineMs) return null;
+			if (this.#deps.timers.now() - startedAt >= deadlineMs) return { status: "timeout" };
 			await this.#sleep(500);
 		}
 	}
@@ -768,11 +892,25 @@ export class CompanionController {
 		this.#binding = binding;
 		this.#bindingGeneration += 1;
 		this.#viewToken = undefined;
+		this.#launchBeforeSessions = undefined;
 		this.#state = "ready";
 		this.#closedReason = undefined;
-		this.#clearNotifyKey("closed-user");
-		this.#clearNotifyKey("closed-exited");
-		this.#clearNotifyKey("blocked");
+		// Recovery: re-arm every launch/close notice so a recurrence notifies again.
+		for (const key of [
+			"closed-user",
+			"closed-exited",
+			"blocked",
+			"unverified",
+			"handshake-ambiguous",
+			"late-bind-ambiguous",
+			"launch-timeout",
+			"shell-timeout",
+			"incomplete-launch",
+			"occupied-pane",
+			"late-bind-shell-changed",
+		]) {
+			this.#clearNotifyKey(key);
+		}
 		this.#scope = { kind: "session", baseSha: this.#baselineHead ?? "" };
 		await this.#resetAnnotations();
 		if (options.reloadToSessionScope) {
@@ -787,21 +925,26 @@ export class CompanionController {
 
 	/**
 	 * Fresh-annotation boundary for a new omp session: clear every note in the
-	 * owned companion only. Failure blocks annotations until the next boundary.
+	 * owned companion only. Returns false when the clear failed; annotations
+	 * stay blocked until a completed /diff selection retries it or the next
+	 * session boundary succeeds.
 	 */
-	async #resetAnnotations(): Promise<void> {
-		if (!this.#binding) return;
+	async #resetAnnotations(): Promise<boolean> {
+		if (!this.#binding) return false;
 		try {
 			await this.#cli.commentClearAll(this.#binding.hunkSessionId, { timeoutMs: 5_000 });
 			this.#resetFailed = false;
+			this.#clearNotifyKey("reset-failed");
+			return true;
 		} catch (error) {
 			this.#resetFailed = true;
 			this.#deps.logger.warn("clean-slate clear failed", { error });
-			this.#notifyOnce(
+			this.#notifyOnChange(
 				"reset-failed",
-				"Hunk: could not clear the previous session's notes; annotations stay disabled until the next session boundary.",
+				"Hunk: could not clear the previous session's notes; annotations are disabled. Complete a /diff selection to retry, or wait for the next session boundary.",
 				"warning",
 			);
+			return false;
 		}
 	}
 
@@ -835,26 +978,48 @@ export class CompanionController {
 		this.#closedReason = reason;
 		this.#binding = undefined;
 		this.#viewToken = undefined;
+		this.#launchBeforeSessions = undefined;
 	}
 
 	#notReadyMessage(): string {
 		if (this.#state === "starting") return "Hunk companion is still starting; try again shortly.";
 		if (this.#state === "closed") return "Open /diff to reopen the Hunk companion.";
-		return "Hunk companion is not available.";
+		return "Hunk companion is unavailable; use /diff to retry.";
 	}
 
 	// ------------------------------------------------------------------ ticks --
 
-	/** Health check + cwd follow. Cheap, read-only, self-serialized per tick. */
-	async lifecycleTick(): Promise<void> {
-		if (this.#lifecycleTickRunning || this.#shutdownStarted) return;
-		this.#lifecycleTickRunning = true;
+	/**
+	 * Health check + cwd follow. Serialized: concurrent callers (interval,
+	 * tools) await the in-flight tick instead of racing it, so no caller
+	 * outruns a transition.
+	 */
+	lifecycleTick(): Promise<void> {
+		if (this.#lifecycleTickPromise) return this.#lifecycleTickPromise;
+		const tick = this.#lifecycleTickInner().finally(() => {
+			this.#lifecycleTickPromise = undefined;
+		});
+		this.#lifecycleTickPromise = tick;
+		return tick;
+	}
+
+	async #lifecycleTickInner(): Promise<void> {
+		if (this.#shutdownStarted) return;
+		if (!this.#eligible) return;
 		try {
-			if (!this.#eligible) return;
+			if (this.#state === "unavailable") {
+				// A parked startup (transient failure, unresolved conflict, malformed
+				// record): retry instead of leaving tools stuck on "still starting".
+				await this.initialize().catch(error => {
+					this.#deps.logger.debug("startup retry failed", { error });
+				});
+				return;
+			}
 			if (this.#state === "closed") {
-				if (this.#closedReason === "left-git") {
-					const checkout = await resolveCheckout(this.#deps.exec, this.#cwd);
-					if (checkout.ok) await this.initialize();
+				if (CLOSED_POLICY[this.#closedReason ?? "user"].autoRecover) {
+					await this.initialize().catch(error => {
+						this.#deps.logger.debug("closed-state recovery failed", { error });
+					});
 				}
 				return;
 			}
@@ -863,14 +1028,19 @@ export class CompanionController {
 				return;
 			}
 			if (this.isReady && this.#record && this.#binding) {
-				const healthy = await this.#healthCheck();
-				if (!healthy) return;
+				const health = await this.#healthCheck();
+				if (health === "indeterminate") return; // transient herdr failure: decide on a later tick
+				if (health !== "healthy") {
+					this.#closeWithReason(health.reason);
+					this.#notifyOnChange(health.notifyKey, health.notice, "info");
+					return;
+				}
 			}
 			const checkout = await resolveCheckout(this.#deps.exec, this.#cwd);
 			if (!checkout.ok) {
 				if (this.#state === "ready") {
 					this.#closeWithReason("left-git");
-					this.#notifyOnce(
+					this.#notifyOnChange(
 						"left-git",
 						"Hunk: left the git checkout; the review tab stays as-is until you return.",
 						"info",
@@ -880,86 +1050,121 @@ export class CompanionController {
 			}
 			if (checkout.repoRoot === this.#repoRoot) return;
 			await this.enqueue(() => this.#rootChange(checkout.repoRoot, checkout.headSha));
-		} finally {
-			this.#lifecycleTickRunning = false;
+		} catch (error) {
+			this.#deps.logger.debug("lifecycle tick failed", { error });
 		}
 	}
 
+	/**
+	 * Bind a launch whose hunk process registered after the inline handshake
+	 * gave up. Requires the recorded shell to still own the pane and the
+	 * session to be new relative to the launch-time registry snapshot — a
+	 * replaced shell or a session that predates the launch is never bound (and
+	 * never cleared).
+	 */
 	async #lateBindTick(): Promise<void> {
 		if (this.#launchInFlight) return; // an inline handshake already owns this bind
-		if (!this.#record) return;
-		let info: PaneProcessInfo;
-		try {
-			info = await this.#paneProcessInfo(this.#record.paneId);
-		} catch {
+		const record = this.#record;
+		if (!record || record.shellPid === undefined) return; // no shell proof: nothing provable to bind
+		const info = await this.#paneInfo(record.paneId);
+		if (info === "indeterminate") return;
+		if (info === "absent") {
+			this.#closeWithReason("user");
+			this.#notifyOnChange("closed-user", "Hunk: companion tab was closed. Use /diff to reopen it.", "info");
 			return;
 		}
-		if (info.foregroundPids.length === 0) return;
-		const before = new Set<string>();
-		const handshake = await this.#handshake(this.#record.paneId, this.#record.repoRoot, before, 2_000);
-		if (handshake === null || "error" in handshake) return;
-		this.#record.hunkSessionId = handshake.hunkSessionId;
-		this.#record.hunkPid = handshake.hunkPid;
+		if (info.shellPid !== record.shellPid) {
+			this.#notifyOnChange(
+				"late-bind-shell-changed",
+				"Hunk: the companion pane's shell changed during startup; refusing to bind. Use /diff to open a fresh companion.",
+				"warning",
+			);
+			return;
+		}
+		if (isIdleShell(info, record.shellPid)) return; // the launch command has no foreground job yet
+		const handshake = await this.#handshake(
+			record.paneId,
+			record.repoRoot,
+			this.#launchBeforeSessions ?? new Set<string>(),
+			record.shellPid,
+			2_000,
+		);
+		if (handshake.status === "ambiguous") {
+			this.#closeWithReason("unverified");
+			this.#notifyOnChange(
+				"late-bind-ambiguous",
+				"Hunk: multiple new review sessions appeared in the companion pane; refusing to bind. Close the tab, then use /diff to relaunch.",
+				"error",
+			);
+			return;
+		}
+		if (handshake.status !== "bound") return; // registration may still lag; stay starting
+		record.hunkSessionId = handshake.hunkSessionId;
+		record.hunkPid = handshake.hunkPid;
 		await this.#persistRecord();
 		await this.#finishBind(handshake, { reloadToSessionScope: false });
 	}
 
-	/** True when the recorded tab, pane, and hunk process all still line up. */
-	async #healthCheck(): Promise<boolean> {
-		if (!this.#record || !this.#binding) return false;
-		if (!(await this.#tabExists(this.#record.tabId))) {
-			this.#closeWithReason("user");
-			this.#notifyOnce("closed-user", "Hunk: companion tab was closed. Use /diff to reopen it.", "info");
-			return false;
+	/**
+	 * "healthy" keeps the tick going; "indeterminate" skips it (a transient
+	 * herdr failure must neither sticky-close nor relaunch); otherwise the
+	 * close decision with its notice.
+	 */
+	async #healthCheck(): Promise<HealthOutcome> {
+		const closedNotice = "Hunk: companion tab was closed. Use /diff to reopen it.";
+		const exitedNotice = "Hunk: the review process exited. Use /diff to relaunch it.";
+		if (!this.#record || !this.#binding) {
+			return { reason: "exited", notifyKey: "closed-exited", notice: exitedNotice };
 		}
-		let info: PaneProcessInfo;
-		try {
-			info = await this.#paneProcessInfo(this.#record.paneId);
-		} catch {
-			this.#closeWithReason("user");
-			this.#notifyOnce("closed-user", "Hunk: companion tab was closed. Use /diff to reopen it.", "info");
-			return false;
+		const tab = await this.#tabPresence(this.#record.tabId);
+		if (tab === "indeterminate") return "indeterminate";
+		if (tab === "absent") {
+			return { reason: "user", notifyKey: "closed-user", notice: closedNotice };
+		}
+		const info = await this.#paneInfo(this.#record.paneId);
+		if (info === "indeterminate") return "indeterminate";
+		if (info === "absent") {
+			return { reason: "user", notifyKey: "closed-user", notice: closedNotice };
 		}
 		if (!info.foregroundPids.includes(this.#binding.hunkPid ?? -1)) {
-			this.#closeWithReason("exited");
-			this.#notifyOnce("closed-exited", "Hunk: the review process exited. Use /diff to relaunch it.", "info");
-			return false;
+			return { reason: "exited", notifyKey: "closed-exited", notice: exitedNotice };
 		}
 		try {
 			const sessions = await this.#cli.sessionList();
 			const registered = sessions.find(entry => entry.sessionId === this.#binding?.hunkSessionId);
 			if (registered === undefined || registered.pid !== this.#binding.hunkPid) {
-				this.#closeWithReason("exited");
-				this.#notifyOnce("closed-exited", "Hunk: the review session is no longer registered. Use /diff to relaunch it.", "info");
-				return false;
+				return {
+					reason: "exited",
+					notifyKey: "closed-exited",
+					notice: "Hunk: the review session is no longer registered. Use /diff to relaunch it.",
+				};
 			}
 		} catch (error) {
+			// Hunk-daemon hiccups are not herdr absence: keep the binding and retry later.
 			this.#deps.logger.debug("health check session list failed", { error });
 		}
-		return true;
+		return "healthy";
 	}
 
 	async #rootChange(newRoot: string, newHead: string): Promise<void> {
+		// Archive the old root's review before any pane input is sent.
 		await this.snapshotNow({ deadlineMs: 1_000 });
-		if (this.isReady && this.#record && this.#binding) {
-			const verified = await this.#verifyOwnedHunkAlive();
-			if (verified) {
-				const stopped = await this.#stopOwnedHunk();
-				if (!stopped) {
-					this.#closeWithReason("blocked");
-					this.#notifyOnce(
-						"blocked",
-						"Hunk: companion pane is busy; it was left untouched. Use /diff to open a new tab.",
-						"warning",
-					);
-					return;
-				}
-				await this.#launchInPane(this.#record.tabId, this.#record.paneId, newRoot, newHead, {
-					shellPid: this.#record.shellPid,
-					foregroundPids: [],
-				});
+		if (this.isReady && this.#record && this.#binding && (await this.#verifyOwnedHunkAlive())) {
+			const stopped = await this.#stopOwnedHunk(this.#record.paneId, this.#record.shellPid);
+			if (!stopped) {
+				this.#closeWithReason("blocked");
+				this.#notifyOnChange(
+					"blocked",
+					"Hunk: companion pane did not return to its shell; it was left untouched. Use /diff to open a new tab.",
+					"warning",
+				);
 				return;
 			}
+			await this.#launchInPane(this.#record.tabId, this.#record.paneId, newRoot, newHead, {
+				shellPid: this.#record.shellPid,
+				foregroundPids: [],
+			});
+			return;
 		}
 		// No verifiable binding: adopt-or-launch for the new root from the record.
 		let record: CompanionRecord | null = null;
@@ -975,7 +1180,7 @@ export class CompanionController {
 	async #verifyOwnedHunkAlive(): Promise<boolean> {
 		if (!this.#record || !this.#binding) return false;
 		try {
-			const info = await this.#paneProcessInfo(this.#record.paneId);
+			const info = await this.#herdr.paneProcessInfo(this.#record.paneId);
 			if (!info.foregroundPids.includes(this.#binding.hunkPid ?? -1)) return false;
 			const sessions = await this.#cli.sessionList();
 			return sessions.some(
@@ -986,21 +1191,15 @@ export class CompanionController {
 		}
 	}
 
-	/** ctrl+c the owned hunk and wait for the recorded shell to be idle again. */
-	async #stopOwnedHunk(deadlineMs = 5_000): Promise<boolean> {
-		if (!this.#record) return false;
-		const shellPid = this.#record.shellPid;
-		await this.#sendCtrlC(this.#record.paneId);
+	/** ctrl+c the pane's foreground job and wait for its shell to be idle again. */
+	async #stopOwnedHunk(paneId: string, shellPid: number | undefined, deadlineMs = 5_000): Promise<boolean> {
+		await this.#herdr.run(["pane", "send-keys", paneId, "ctrl+c"], "pane send-keys");
 		const startedAt = this.#deps.timers.now();
 		for (;;) {
-			try {
-				const info = await this.#paneProcessInfo(this.#record.paneId);
-				if (info.foregroundPids.length === 0) return true;
-				if (shellPid !== undefined && info.foregroundPids.every(pid => pid === shellPid)) return true;
-				if (shellPid === undefined) return false;
-			} catch {
-				return false;
-			}
+			if (this.#shutdownStarted) return false;
+			const info = await this.#paneInfo(paneId);
+			if (typeof info === "string") return false; // pane gone or herdr unreachable: not proven idle
+			if (isIdleShell(info, shellPid)) return true;
 			if (this.#deps.timers.now() - startedAt >= deadlineMs) return false;
 			await this.#sleep(250);
 		}
@@ -1008,11 +1207,15 @@ export class CompanionController {
 
 	// ------------------------------------------------------------- /diff API --
 
+	/** Completed /diff selection: retry a failed clean-slate reset, then reload. */
 	async selectScope(scope: ReviewScope): Promise<void> {
 		await this.enqueue(async () => {
 			if (!this.isReady || !this.#binding) {
 				throw new CompanionUnavailable(this.#notReadyMessage());
 			}
+			// A previously failed reset is retried by the completed selection;
+			// success clears the flag and re-arms the failure notice.
+			if (this.#resetFailed) await this.#resetAnnotations();
 			await this.#cli.reload(this.#binding.hunkSessionId, hunkReloadArgs(scope), { timeoutMs: 5_000 });
 			this.#scope = scope;
 			this.#viewToken = undefined;
@@ -1076,7 +1279,8 @@ export class CompanionController {
 	}
 
 	#captureErrorReason(error: unknown): string {
-		if (error instanceof HunkCliError) return `Hunk CLI error: ${error.message}`;
+		// CommandCliError messages are already context-prefixed by the CLI layer.
+		if (error instanceof CommandCliError) return error.message;
 		if (error instanceof CompanionUnavailable) return error.message;
 		return "Hunk companion call failed; try again shortly.";
 	}
@@ -1113,7 +1317,8 @@ export class CompanionController {
 			if (this.#resetFailed) {
 				return {
 					ok: false,
-					error: "Annotations are unavailable: the clean-slate reset failed earlier. Reopen via /diff.",
+					error:
+						"Annotations are unavailable: the clean-slate reset failed earlier. Complete a /diff selection to retry it.",
 				};
 			}
 			const record = this.#viewToken;
@@ -1138,14 +1343,18 @@ export class CompanionController {
 			try {
 				result = await this.#cli.commentAdd(this.#binding.hunkSessionId, request, { signal });
 			} catch (error) {
-				if (error instanceof HunkCliError && (error.exitCode !== 0 || error.message.includes("timed out"))) {
-					const timedOut = error.message.includes("timed out");
+				if (error instanceof CommandCliError && error.message.includes("timed out")) {
+					// The write may or may not have landed; a blind retry could
+					// duplicate it. Kill the token so the next attempt needs a fresh
+					// hunk_review.
+					this.#viewToken = undefined;
 					return {
 						ok: false,
-						error: timedOut
-							? "Comment write timed out; the outcome is unknown. Call hunk_review before retrying."
-							: `Hunk rejected the comment: ${error.message}`,
+						error: "Comment write timed out; the outcome is unknown. Call hunk_review before retrying.",
 					};
+				}
+				if (error instanceof CommandCliError) {
+					return { ok: false, error: `Hunk rejected the comment: ${error.message}` };
 				}
 				return { ok: false, error: this.#captureErrorReason(error) };
 			}
@@ -1163,15 +1372,24 @@ export class CompanionController {
 	// --------------------------------------------------------------- archives --
 
 	async snapshotNow(options?: { deadlineMs?: number }): Promise<boolean> {
-		if (this.#archiveTickRunning) return false;
-		if (!this.isReady || !this.#binding || !this.#scope) return false;
-		const artifactsDir = this.#artifactsDir;
-		if (artifactsDir === null) {
-			this.#deps.logger.debug("skipping archive: session has no artifact directory");
-			return false;
-		}
-		this.#archiveTickRunning = true;
+		if (this.#archiveRunning) return false; // a 30s tick can outlive its interval
+		this.#archiveRunning = true;
 		try {
+			if (!this.isReady || !this.#binding || !this.#scope) return false;
+			const artifactsDir = this.#artifactsDir;
+			if (artifactsDir === null) {
+				this.#deps.logger.debug("skipping archive: session has no artifact directory");
+				return false;
+			}
+			// Capture identity/destination before awaiting; discard outdated work
+			// instead of writing into a replacement session's archive.
+			const boundSessionId = this.#binding.hunkSessionId;
+			const boundGeneration = this.#bindingGeneration;
+			const ompSessionId = this.#ompSessionId ?? "";
+			const workspaceId = this.#workspaceId();
+			const tabId = this.#record?.tabId ?? "";
+			const paneId = this.#record?.paneId ?? "";
+			const repoRoot = this.#repoRoot ?? "";
 			const deadline = options?.deadlineMs;
 			const capture = await this.#withDeadline(this.captureStable(), deadline);
 			if (capture === undefined) {
@@ -1182,15 +1400,19 @@ export class CompanionController {
 				this.#deps.logger.debug("archive capture skipped", { reason: capture.reason });
 				return false;
 			}
+			if (this.#bindingGeneration !== boundGeneration || this.#binding?.hunkSessionId !== boundSessionId) {
+				this.#deps.logger.debug("archive discarded: companion rebound during capture");
+				return false;
+			}
 			const envelope: SnapshotEnvelope = {
 				version: 1,
 				capturedAt: capture.capture.capturedAt,
-				ompSessionId: this.#ompSessionId ?? "",
-				workspaceId: this.#workspaceId(),
-				tabId: this.#record?.tabId ?? "",
-				paneId: this.#record?.paneId ?? "",
+				ompSessionId,
+				workspaceId,
+				tabId,
+				paneId,
 				hunkSessionId: capture.capture.hunkSessionId,
-				repoRoot: this.#repoRoot ?? "",
+				repoRoot,
 				scope: capture.capture.scope,
 				publication: {
 					generation: capture.capture.publication.generation,
@@ -1207,37 +1429,40 @@ export class CompanionController {
 			this.#deps.logger.warn("archive write failed", { error });
 			return false;
 		} finally {
-			this.#archiveTickRunning = false;
+			this.#archiveRunning = false;
 		}
 	}
 
 	async #withDeadline<T>(promise: Promise<T>, deadlineMs?: number): Promise<T | undefined> {
 		if (deadlineMs === undefined) return promise;
 		const { promise: raced, resolve } = Promise.withResolvers<T | undefined>();
-		this.#deps.timers.setTimeout(() => resolve(undefined), deadlineMs);
-		return Promise.race([promise, raced]);
+		const handle = this.#deps.timers.setTimeout(() => resolve(undefined), deadlineMs);
+		const settled = await Promise.race([promise, raced]);
+		this.#deps.timers.clearTimeout(handle);
+		return settled;
 	}
 
 	// --------------------------------------------------------------- shutdown --
 
 	async shutdown(deadlineMs: number): Promise<void> {
 		this.#shutdownStarted = true;
-		this.#deps.timers.clearInterval(this.#readinessPollHandle);
-		this.#readinessPollHandle = undefined;
 		try {
 			await this.snapshotNow({ deadlineMs });
 		} catch (error) {
 			this.#deps.logger.debug("final snapshot failed", { error });
 		}
 		this.#state = "unavailable";
+		this.#closedReason = undefined;
 		this.#binding = undefined;
 		this.#viewToken = undefined;
+		this.#launchBeforeSessions = undefined;
 	}
 
+	/** Resolves immediately once shutdown started so poll loops never hang. */
 	#sleep(ms: number): Promise<void> {
+		if (this.#shutdownStarted) return Promise.resolve();
 		const { promise, resolve } = Promise.withResolvers<void>();
-		const handle = this.#deps.timers.setTimeout(() => resolve(), ms);
-		if (this.#shutdownStarted) this.#deps.timers.clearTimeout(handle);
+		this.#deps.timers.setTimeout(resolve, ms);
 		return promise;
 	}
 

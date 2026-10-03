@@ -31,6 +31,19 @@ export class FakeExec implements ExecRunner {
 		});
 	}
 
+	/** Priority responder checked before install-ed ones; returns a disposer. */
+	override(
+		matcher: (call: RecordedCall) => boolean,
+		reply: ExecOutcome | ((call: RecordedCall) => ExecOutcome | Promise<ExecOutcome>),
+	): () => void {
+		const entry = { matcher, reply: typeof reply === "function" ? reply : () => reply };
+		this.#installed.unshift(entry);
+		return () => {
+			const index = this.#installed.indexOf(entry);
+			if (index >= 0) this.#installed.splice(index, 1);
+		};
+	}
+
 	/** Reply to the next command whose args start with these prefixes. */
 	enqueue(matcher: (call: RecordedCall) => boolean, reply: ExecOutcome | ((call: RecordedCall) => ExecOutcome)): void {
 		this.#queue.push(call => {
@@ -210,6 +223,7 @@ export interface HarnessSession {
 	cwd: string;
 	repoRoot: string;
 	generation: string;
+	stateRevision: number;
 }
 
 export interface HarnessPane {
@@ -247,6 +261,25 @@ export interface Harness {
 	deferredPaneId?: string;
 	/** When true, ctrl+c does not clear the pane foreground (busy fixture). */
 	ctrlcNoop: boolean;
+	/** When true, ctrl+c leaves only the shell pid in the pane foreground. */
+	ctrlcLeavesShell: boolean;
+	/** When true, comment clear fails (clean-slate reset fixture). */
+	failClears: boolean;
+	/** When true, session get omits the review publication (missing generation). */
+	omitGeneration: boolean;
+	/** When true, the next session get bumps that session's generation after replying. */
+	bumpGenerationOnNextGet: boolean;
+	/** When true, the next session get bumps stateRevision after replying. */
+	bumpStateRevisionOnNextGet: boolean;
+	/** When true, session get replies only once releaseSessionGet is called. */
+	hangSessionGet: boolean;
+	sessionGetGate: { resolve(outcome: ExecOutcome): void } | null;
+	/** Payload captured at hang time; releaseSessionGet resolves with it. */
+	pendingSessionGetPayload: unknown;
+	releaseSessionGet(): void;
+	/** When true, comment add replies only once commentAddGate is resolved. */
+	hangCommentAdd: boolean;
+	commentAddGate: ((outcome: ExecOutcome) => void) | null;
 	addSession(repoRoot: string, paneId: string): HarnessSession;
 }
 
@@ -266,6 +299,31 @@ function okJson(value: unknown): { stdout: string; stderr: string; code: number;
 
 export function harnessFail(stderr: string): { stdout: string; stderr: string; code: number; killed: boolean } {
 	return { stdout: "", stderr, code: 1, killed: false };
+}
+
+/** herdr proved absence via its structured stderr envelope. */
+export function herdrAbsent(code: "tab_not_found" | "pane_not_found"): ExecOutcome {
+	return {
+		stdout: "",
+		stderr: `${JSON.stringify({ error: { code, message: code } })}\n`,
+		code: 1,
+		killed: false,
+	};
+}
+
+/** herdr-side server failure: indeterminate, never absence. */
+export function herdrTransient(): ExecOutcome {
+	return {
+		stdout: "",
+		stderr: `${JSON.stringify({ error: { code: "internal_error", message: "socket hiccup" } })}\n`,
+		code: 1,
+		killed: false,
+	};
+}
+
+/** Process killed by its exec timeout: unknown outcome for writes, indeterminate for reads. */
+export function killedOutcome(): ExecOutcome {
+	return { stdout: "", stderr: "", code: 0, killed: true };
 }
 
 export const HARNESS_SOCKET = "/tmp/herdr-test.sock";
@@ -307,6 +365,21 @@ export function createHerdrHarness(): Harness {
 		launchRegistrationDeferred: false,
 		deferredPaneId: undefined,
 		ctrlcNoop: false,
+		ctrlcLeavesShell: false,
+		failClears: false,
+		omitGeneration: false,
+		bumpGenerationOnNextGet: false,
+		bumpStateRevisionOnNextGet: false,
+		hangSessionGet: false,
+		sessionGetGate: null,
+		releaseSessionGet: () => {
+			const gate = harness.sessionGetGate;
+			if (!gate) return;
+			harness.sessionGetGate = null;
+			gate.resolve(okJson(harness.pendingSessionGetPayload));
+		},
+		hangCommentAdd: false,
+		commentAddGate: null,
 		addSession: (repoRoot, paneId) => {
 			const pid = ++harness.nextPid;
 			const session: HarnessSession = {
@@ -315,12 +388,14 @@ export function createHerdrHarness(): Harness {
 				cwd: repoRoot,
 				repoRoot,
 				generation: "gen-1",
+				stateRevision: 1,
 			};
 			harness.sessions.push(session);
 			const pane = harness.panes.get(paneId);
 			if (pane !== undefined) pane.foreground.push(pid);
 			return session;
 		},
+		pendingSessionGetPayload: null,
 	};
 
 	harness.exec.install(
@@ -345,7 +420,7 @@ export function createHerdrHarness(): Harness {
 			for (const pane of harness.panes.values()) {
 				if (pane.tabId === tabId) return okJson({ result: { tab: { tab_id: tabId } } });
 			}
-			return harnessFail("tab not found");
+			return herdrAbsent("tab_not_found");
 		},
 	);
 
@@ -369,7 +444,7 @@ export function createHerdrHarness(): Harness {
 		call => call.command === "herdr" && call.args[0] === "pane" && call.args[1] === "process-info",
 		call => {
 			const pane = harness.panes.get(call.args[3]);
-			if (pane === undefined) return harnessFail("pane not found");
+			if (pane === undefined) return herdrAbsent("pane_not_found");
 			return okJson({
 				result: {
 					process_info: {
@@ -385,7 +460,7 @@ export function createHerdrHarness(): Harness {
 		call => call.command === "herdr" && call.args[0] === "pane" && call.args[1] === "get",
 		call => {
 			const pane = harness.panes.get(call.args[2]);
-			if (pane === undefined) return harnessFail("pane not found");
+			if (pane === undefined) return herdrAbsent("pane_not_found");
 			return okJson({
 				result: { pane: { pane_id: call.args[2], tab_id: pane.tabId, workspace_id: HARNESS_WORKSPACE } },
 			});
@@ -421,7 +496,10 @@ export function createHerdrHarness(): Harness {
 				harness.ctrlcSent += 1;
 				if (!harness.ctrlcNoop) {
 					const pane = harness.panes.get(call.args[2]);
-					if (pane !== undefined) pane.foreground = [];
+					if (pane !== undefined) {
+						// herdr may keep reporting the shell as the foreground process.
+						pane.foreground = harness.ctrlcLeavesShell ? [pane.shellPid] : [];
+					}
 				}
 			}
 			return okJson({ result: {} });
@@ -449,7 +527,10 @@ export function createHerdrHarness(): Harness {
 		call => {
 			const session = harness.sessions.find(entry => entry.sessionId === call.args[2]);
 			if (session === undefined) return harnessFail("No active session matches");
-			return okJson({
+			const publication = harness.omitGeneration
+				? undefined
+				: { generation: session.generation, stateRevision: session.stateRevision };
+			const payload = {
 				session: {
 					sessionId: session.sessionId,
 					pid: session.pid,
@@ -461,11 +542,28 @@ export function createHerdrHarness(): Harness {
 							liveCommentCount: 0,
 							liveComments: [],
 							reviewNotes: [],
-							reviewPublication: { generation: session.generation, stateRevision: 1 },
+							...(publication === undefined ? {} : { reviewPublication: publication }),
 						},
 					},
 				},
-			});
+			};
+			if (harness.hangSessionGet) {
+				harness.pendingSessionGetPayload = payload;
+				return new Promise<ExecOutcome>(resolve => {
+					harness.sessionGetGate = { resolve };
+				});
+			}
+			// Post-reply bumps model a review that changes between the two gets
+			// of a stable capture (generation drift vs stateRevision-only drift).
+			if (harness.bumpGenerationOnNextGet) {
+				harness.bumpGenerationOnNextGet = false;
+				session.generation = "gen-next";
+			}
+			if (harness.bumpStateRevisionOnNextGet) {
+				harness.bumpStateRevisionOnNextGet = false;
+				session.stateRevision += 1;
+			}
+			return okJson(payload);
 		},
 	);
 
@@ -502,6 +600,11 @@ export function createHerdrHarness(): Harness {
 		call => {
 			harness.adds += 1;
 			harness.lastAddArgs = [...call.args];
+			if (harness.hangCommentAdd) {
+				return new Promise<ExecOutcome>(resolve => {
+					harness.commentAddGate = resolve;
+				});
+			}
 			if (harness.bumpGenerationOnAdd) {
 				const session = harness.sessions.find(entry => entry.sessionId === call.args[3]);
 				if (session !== undefined) session.generation = "gen-bumped";
@@ -515,6 +618,7 @@ export function createHerdrHarness(): Harness {
 	harness.exec.install(
 		call => call.command === "hunk" && call.args[0] === "session" && call.args[2] === "clear",
 		() => {
+			if (harness.failClears) return harnessFail("comment clear failed");
 			harness.clears += 1;
 			return okJson({ result: { removedCount: 3 } });
 		},

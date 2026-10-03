@@ -19,7 +19,7 @@ import {
 	type CompanionTimers,
 	type NotifyLevel,
 } from "./companion";
-import { CompanionUnavailable, HunkCliError } from "./hunk-cli";
+import { CompanionUnavailable, CommandCliError } from "./hunk-cli";
 import { listBranches, listRecentCommits, type BranchChoice, type CommitChoice } from "./diff-targets";
 
 const SCOPE_LABELS = {
@@ -49,13 +49,10 @@ type UiLike = {
 
 interface Runtime {
 	controller: CompanionController;
-	deps: CompanionDeps;
 	ui: UiLike | null;
 	timers: CompanionTimers | null;
 	lifecycleHandle: unknown;
 	archiveHandle: unknown;
-	lifecycleRunning: boolean;
-	archiveRunning: boolean;
 }
 
 function createLogger(pi: ExtensionAPI): CompanionLogger {
@@ -78,8 +75,11 @@ function createLogger(pi: ExtensionAPI): CompanionLogger {
 	};
 }
 
-function isMainSession(ctx: { agent: { kind: string } }): boolean {
-	return ctx.agent.kind === "main";
+function unavailableReason(ctx: { agent: { kind: string }; mode: string }): string | undefined {
+	if (ctx.agent.kind !== "main") return "Hunk companion runs only in the main session.";
+	if (ctx.mode !== "tui") return "Hunk companion requires an interactive TUI session; headless mode is disabled.";
+	if (!eligibleEnv(process.env)) return "Not running inside a herdr workspace; skipping Hunk companion launch.";
+	return undefined;
 }
 
 function uiFrom(ctx: unknown): UiLike | null {
@@ -93,7 +93,7 @@ function uiFrom(ctx: unknown): UiLike | null {
 
 function errorText(error: unknown): string {
 	if (error instanceof CompanionUnavailable) return error.message;
-	if (error instanceof HunkCliError) return `Hunk CLI error: ${error.message}`;
+	if (error instanceof CommandCliError) return `CLI error: ${error.message}`;
 	return error instanceof Error ? error.message : "Unexpected hunk companion failure.";
 }
 
@@ -119,13 +119,10 @@ export default function hunkCompanionExtension(pi: ExtensionAPI): void {
 	};
 	const runtime: Runtime = {
 		controller: new CompanionController(deps),
-		deps,
 		ui: null,
 		timers: null,
 		lifecycleHandle: undefined,
 		archiveHandle: undefined,
-		lifecycleRunning: false,
-		archiveRunning: false,
 	};
 
 	const syncContext = (ctx: {
@@ -155,36 +152,36 @@ export default function hunkCompanionExtension(pi: ExtensionAPI): void {
 	};
 
 	const runLifecycleTick = async (ctx: {
+		agent: { kind: string };
+		mode: string;
 		sessionManager: { getCwd(): string };
 	}): Promise<void> => {
-		if (runtime.lifecycleRunning) return;
-		runtime.lifecycleRunning = true;
+		if (unavailableReason(ctx)) return;
 		try {
 			runtime.controller.setCwd(ctx.sessionManager.getCwd());
 			await runtime.controller.lifecycleTick();
 		} catch (error) {
 			deps.logger.debug("lifecycle tick failed", { error });
-		} finally {
-			runtime.lifecycleRunning = false;
 		}
 	};
 
-	const runArchiveTick = async (): Promise<void> => {
-		if (runtime.archiveRunning) return;
-		runtime.archiveRunning = true;
+	const runArchiveTick = async (ctx: { agent: { kind: string }; mode: string }): Promise<void> => {
+		if (unavailableReason(ctx)) return;
 		try {
 			await runtime.controller.snapshotNow({ deadlineMs: 10_000 });
 		} catch (error) {
 			deps.logger.debug("archive tick failed", { error });
-		} finally {
-			runtime.archiveRunning = false;
 		}
 	};
 
-	// ------------------------------------------------------------- lifecycle --
 
 	pi.on("session_start", async (_event, ctx) => {
-		if (!isMainSession(ctx)) return;
+		const reason = unavailableReason(ctx);
+		if (reason) {
+			if (ctx.agent.kind === "main" && ctx.mode === "tui") uiFrom(ctx)?.notify(reason, "info");
+			deps.logger.debug(reason);
+			return;
+		}
 		syncContext(ctx);
 		attachTimers({
 			setInterval: (callback, ms) => ctx.setInterval(callback, ms),
@@ -193,55 +190,59 @@ export default function hunkCompanionExtension(pi: ExtensionAPI): void {
 			clearTimeout: handle => ctx.clearTimer(handle as Parameters<typeof ctx.clearTimer>[0]),
 			now: () => Date.now(),
 		});
-		runtime.lifecycleHandle = ctx.setInterval(() => void runLifecycleTick(ctx), LIFECYCLE_INTERVAL_MS);
-		runtime.archiveHandle = ctx.setInterval(() => void runArchiveTick(), ARCHIVE_INTERVAL_MS);
-		ctx.setTimeout(() => {
-			runtime.controller.initialize().catch(error => {
-				deps.logger.warn("companion startup failed", { error });
-			});
-		}, 0);
+		if (runtime.lifecycleHandle === undefined) {
+			runtime.lifecycleHandle = ctx.setInterval(() => void runLifecycleTick(ctx), LIFECYCLE_INTERVAL_MS);
+			runtime.archiveHandle = ctx.setInterval(() => void runArchiveTick(ctx), ARCHIVE_INTERVAL_MS);
+			ctx.setTimeout(() => {
+				if (unavailableReason(ctx)) return;
+				runtime.controller.initialize().catch(error => {
+					deps.logger.warn("companion startup failed", { error });
+				});
+			}, 0);
+		}
 	});
 
 	pi.on("session_before_switch", async (_event, ctx) => {
-		if (!isMainSession(ctx)) return;
+		if (unavailableReason(ctx)) return;
 		syncContext(ctx);
 		await runtime.controller.snapshotNow({ deadlineMs: 1_000 });
 	});
 
 	for (const eventName of ["session_switch", "session_branch"] as const) {
 		pi.on(eventName, async (_event, ctx) => {
-			if (!isMainSession(ctx)) return;
+			if (unavailableReason(ctx)) return;
 			syncContext(ctx);
 			await runtime.controller.onSessionChanged(ctx.sessionManager.getSessionId());
 		});
 	}
 
 	pi.on("before_agent_start", async (event, ctx) => {
-		if (!isMainSession(ctx)) return undefined;
+		if (unavailableReason(ctx)) return undefined;
 		syncContext(ctx);
-		if (!eligibleEnv(deps.env) || !runtime.controller.isReady) return undefined;
+		if (!runtime.controller.isReady) return undefined;
 		if (event.systemPrompt.includes(guidance)) return undefined;
 		return { systemPrompt: [...event.systemPrompt, guidance] };
 	});
 
-	pi.on("session_shutdown", async () => {
+	pi.on("session_shutdown", async (_event, ctx) => {
+		if (unavailableReason(ctx)) return;
 		stopTicks();
 		await runtime.controller.shutdown(1_500);
 	});
 
-	// ------------------------------------------------------------- /diff ------
 
 	pi.registerCommand("diff", {
 		description: "Switch the Hunk companion's diff view (selectors only)",
 		handler: async (args, ctx) => {
-			if (!isMainSession(ctx)) return;
+			const reason = unavailableReason(ctx);
+			if (reason) {
+				uiFrom(ctx)?.notify(reason, "warning");
+				deps.logger.debug(reason);
+				return;
+			}
 			syncContext(ctx);
 			if (args.trim().length > 0) {
 				runtime.ui?.notify("Use /diff without arguments.", "warning");
-				return;
-			}
-			if (!eligibleEnv(deps.env)) {
-				runtime.ui?.notify("Hunk companion requires omp running inside a herdr workspace.", "warning");
 				return;
 			}
 			const controller = runtime.controller;
@@ -325,7 +326,6 @@ export default function hunkCompanionExtension(pi: ExtensionAPI): void {
 		},
 	});
 
-	// --------------------------------------------------------------- tools ----
 
 	const z = pi.zod;
 
@@ -339,14 +339,13 @@ export default function hunkCompanionExtension(pi: ExtensionAPI): void {
 		parameters: z.object({}),
 		approval: "read",
 		execute: async (_toolCallId, _params, signal, _onUpdate, ctx) => {
-			if (!isMainSession(ctx)) {
-				return { content: [{ type: "text", text: "hunk_review runs only in the main session." }] };
-			}
+			const reason = unavailableReason(ctx);
+			if (reason) return { content: [{ type: "text", text: reason }] };
 			syncContext(ctx);
-			if (!eligibleEnv(deps.env)) {
-				return {
-					content: [{ type: "text", text: "Hunk companion requires omp running inside a herdr workspace." }],
-				};
+			try {
+				await runtime.controller.lifecycleTick();
+			} catch (error) {
+				return { content: [{ type: "text", text: errorText(error) }] };
 			}
 			const outcome = await runtime.controller.captureStable(signal);
 			if (!outcome.ok || !outcome.capture) {
@@ -364,7 +363,12 @@ export default function hunkCompanionExtension(pi: ExtensionAPI): void {
 				"\t",
 			);
 			if (Buffer.byteLength(payload) > REVIEW_SPILL_BYTES) {
-				const artifactId = await ctx.sessionManager.saveArtifact(payload, "hunk-review");
+				let artifactId: string | undefined;
+				try {
+					artifactId = await ctx.sessionManager.saveArtifact(payload, "hunk-review");
+				} catch (error) {
+					deps.logger.warn("review artifact spill failed", { error });
+				}
 				if (artifactId === undefined) {
 					return {
 						content: [
@@ -421,10 +425,14 @@ export default function hunkCompanionExtension(pi: ExtensionAPI): void {
 		parameters: z.union([lineCommentSchema, replyCommentSchema]),
 		approval: "write",
 		execute: async (_toolCallId, params, signal, _onUpdate, ctx) => {
-			if (!isMainSession(ctx)) {
-				return { content: [{ type: "text", text: "hunk_comment runs only in the main session." }] };
-			}
+			const reason = unavailableReason(ctx);
+			if (reason) return { content: [{ type: "text", text: reason }] };
 			syncContext(ctx);
+			try {
+				await runtime.controller.lifecycleTick();
+			} catch (error) {
+				return { content: [{ type: "text", text: errorText(error) }] };
+			}
 			const input = params as
 				| { kind: "line"; viewToken: string; filePath: string; side: "old" | "new"; line: number; summary: string; rationale?: string }
 				| { kind: "reply"; viewToken: string; replyTo: string; summary: string; rationale?: string };

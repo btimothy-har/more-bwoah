@@ -8,6 +8,8 @@
  * root and can bind to a different live session.
  */
 
+import { asRecord } from "./boundary";
+
 export interface ExecOutcome {
 	stdout: string;
 	stderr: string;
@@ -27,14 +29,19 @@ export type ExecRunner = (
 	options?: ExecRunnerOptions,
 ) => Promise<ExecOutcome>;
 
-export class HunkCliError extends Error {
+/**
+ * CLI-neutral failure for any wrapped external command (hunk, herdr, git):
+ * carries exit code and stderr so callers can classify without instanceof
+ * per-CLI hierarchies.
+ */
+export class CommandCliError extends Error {
 	constructor(
 		message: string,
 		readonly exitCode: number,
 		readonly stderrText: string,
 	) {
 		super(message);
-		this.name = "HunkCliError";
+		this.name = "CommandCliError";
 	}
 }
 
@@ -80,11 +87,6 @@ export interface HunkCliCallOptions {
 	timeoutMs?: number;
 }
 
-function asRecord(value: unknown): Record<string, unknown> | null {
-	if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
-	return value as Record<string, unknown>;
-}
-
 function optionalString(record: Record<string, unknown>, key: string): string | undefined {
 	const value = record[key];
 	return typeof value === "string" ? value : undefined;
@@ -98,7 +100,7 @@ function optionalNumber(record: Record<string, unknown>, key: string): number | 
 function requireString(record: Record<string, unknown>, key: string, context: string): string {
 	const value = record[key];
 	if (typeof value !== "string" || value.length === 0) {
-		throw new HunkCliError(`${context}: missing or invalid "${key}"`, 0, "");
+		throw new CommandCliError(`${context}: missing or invalid "${key}"`, 0, "");
 	}
 	return value;
 }
@@ -106,7 +108,7 @@ function requireString(record: Record<string, unknown>, key: string, context: st
 function requireNumber(record: Record<string, unknown>, key: string, context: string): number {
 	const value = record[key];
 	if (typeof value !== "number" || !Number.isFinite(value)) {
-		throw new HunkCliError(`${context}: missing or invalid "${key}"`, 0, "");
+		throw new CommandCliError(`${context}: missing or invalid "${key}"`, 0, "");
 	}
 	return value;
 }
@@ -116,18 +118,18 @@ function parseEnvelope(stdout: string, context: string): Record<string, unknown>
 	try {
 		parsed = JSON.parse(stdout);
 	} catch {
-		throw new HunkCliError(`${context}: hunk returned malformed JSON`, 0, stdout.slice(0, 400));
+		throw new CommandCliError(`${context}: hunk returned malformed JSON`, 0, stdout.slice(0, 400));
 	}
 	const record = asRecord(parsed);
 	if (!record) {
-		throw new HunkCliError(`${context}: hunk returned an unexpected JSON payload`, 0, "");
+		throw new CommandCliError(`${context}: hunk returned an unexpected JSON payload`, 0, "");
 	}
 	return record;
 }
 
 function parseSession(value: unknown, context: string): RegisteredSession {
 	const record = asRecord(value);
-	if (!record) throw new HunkCliError(`${context}: malformed session entry`, 0, "");
+	if (!record) throw new CommandCliError(`${context}: malformed session entry`, 0, "");
 	return {
 		sessionId: requireString(record, "sessionId", context),
 		pid: requireNumber(record, "pid", context),
@@ -156,8 +158,6 @@ export interface SessionSnapshot {
 export interface ReviewCapture {
 	/** Verbatim `review` JSON from Hunk; passed through without reinterpretation. */
 	review: Record<string, unknown>;
-	fileCount: number;
-	noteCount: number;
 }
 
 export interface ReloadResult {
@@ -181,7 +181,7 @@ export class HunkCli {
 		});
 		if (outcome.code !== 0 || outcome.killed) {
 			const detail = outcome.stderr.trim() || outcome.stdout.trim();
-			throw new HunkCliError(
+			throw new CommandCliError(
 				outcome.killed ? `${context}: hunk call timed out` : `${context}: ${detail || "hunk call failed"}`,
 				outcome.code,
 				detail,
@@ -194,7 +194,7 @@ export class HunkCli {
 		const envelope = await this.#run(["session", "list", "--json"], "session list", options);
 		const sessions = envelope["sessions"];
 		if (!Array.isArray(sessions)) {
-			throw new HunkCliError("session list: malformed response", 0, "");
+			throw new CommandCliError("session list: malformed response", 0, "");
 		}
 		return sessions.map(entry => parseSession(entry, "session list"));
 	}
@@ -202,7 +202,7 @@ export class HunkCli {
 	async sessionGet(sessionId: string, options?: HunkCliCallOptions): Promise<SessionSnapshot> {
 		const envelope = await this.#run(["session", "get", sessionId, "--json"], "session get", options);
 		const session = asRecord(envelope["session"]);
-		if (!session) throw new HunkCliError("session get: malformed response", 0, "");
+		if (!session) throw new CommandCliError("session get: malformed response", 0, "");
 		return {
 			session: parseSession(session, "session get"),
 			publication: publicationFromSession(session),
@@ -216,10 +216,8 @@ export class HunkCli {
 			options,
 		);
 		const review = asRecord(envelope["review"]);
-		if (!review) throw new HunkCliError("session review: malformed response", 0, "");
-		const files = Array.isArray(review["files"]) ? review["files"] : [];
-		const notes = Array.isArray(review["reviewNotes"]) ? review["reviewNotes"] : [];
-		return { review, fileCount: files.length, noteCount: notes.length };
+		if (!review) throw new CommandCliError("session review: malformed response", 0, "");
+		return { review };
 	}
 
 	async reload(
@@ -233,10 +231,10 @@ export class HunkCli {
 			options,
 		);
 		const result = asRecord(envelope["result"]);
-		if (!result) throw new HunkCliError("session reload: malformed response", 0, "");
+		if (!result) throw new CommandCliError("session reload: malformed response", 0, "");
 		const reloadedId = requireString(result, "sessionId", "session reload");
 		if (reloadedId !== sessionId) {
-			throw new HunkCliError("session reload: hunk reloaded a different session", 0, "");
+			throw new CommandCliError("session reload: hunk reloaded a different session", 0, "");
 		}
 		return { sessionId: reloadedId };
 	}
@@ -247,27 +245,27 @@ export class HunkCli {
 		options?: HunkCliCallOptions,
 	): Promise<CommentAddResult> {
 		const args = ["session", "comment", "add", sessionId];
+		// Value options use joined --opt=value form so a value binds to its
+		// option lexically and can never be read as a flag.
 		if (request.replyTo !== undefined) {
-			args.push("--reply-to", request.replyTo);
+			args.push(`--reply-to=${request.replyTo}`);
 		} else {
 			if (!request.file) {
-				throw new HunkCliError("comment add: line comments require a file path", 0, "");
+				throw new CommandCliError("comment add: line comments require a file path", 0, "");
 			}
-			args.push("--file", request.file);
-			if (request.side === "old") {
-				args.push("--old-line", String(request.line));
-			} else {
-				args.push("--new-line", String(request.line));
-			}
+			args.push(`--file=${request.file}`);
+			args.push(
+				request.side === "old" ? `--old-line=${request.line}` : `--new-line=${request.line}`,
+			);
 		}
-		args.push("--summary", request.summary);
+		args.push(`--summary=${request.summary}`);
 		if (request.rationale !== undefined && request.rationale.length > 0) {
-			args.push("--rationale", request.rationale);
+			args.push(`--rationale=${request.rationale}`);
 		}
-		args.push("--author", "omp", "--json");
+		args.push("--author=omp", "--json");
 		const envelope = await this.#run(args, "comment add", options);
 		const result = asRecord(envelope["result"]);
-		if (!result) throw new HunkCliError("comment add: malformed response", 0, "");
+		if (!result) throw new CommandCliError("comment add: malformed response", 0, "");
 		return {
 			commentId: requireString(result, "commentId", "comment add"),
 			filePath: optionalString(result, "filePath"),
@@ -284,7 +282,7 @@ export class HunkCli {
 			options,
 		);
 		const result = asRecord(envelope["result"]);
-		if (!result) throw new HunkCliError("comment clear: malformed response", 0, "");
+		if (!result) throw new CommandCliError("comment clear: malformed response", 0, "");
 		return { removedCount: optionalNumber(result, "removedCount") };
 	}
 }

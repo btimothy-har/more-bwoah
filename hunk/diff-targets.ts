@@ -10,8 +10,8 @@
  * - commit scope pins one commit (`hunk show <sha>`), immune to HEAD movement.
  */
 
-import * as nodeFs from "node:fs/promises";
-import { HunkCliError, type ExecRunner } from "./hunk-cli";
+import { canonicalPath } from "./boundary";
+import { CommandCliError, type ExecRunner } from "./hunk-cli";
 
 export type ReviewScope =
 	| { kind: "session"; baseSha: string }
@@ -34,14 +34,6 @@ export type CheckoutStatus =
 
 const GIT_TIMEOUT_MS = 5_000;
 
-async function canonicalPath(path: string): Promise<string> {
-	try {
-		return await nodeFs.realpath(path);
-	} catch {
-		return path;
-	}
-}
-
 function firstLine(text: string): string {
 	const line = text.trim().split("\n", 1)[0] ?? "";
 	return line.trim();
@@ -58,7 +50,7 @@ async function git(exec: ExecRunner, cwd: string, args: string[]): Promise<strin
 	const outcome = await exec("git", args, { cwd, timeoutMs: GIT_TIMEOUT_MS });
 	if (outcome.code !== 0 || outcome.killed) {
 		const detail = firstLine(outcome.stderr) || `git ${args[0]} failed`;
-		throw new HunkCliError(detail, outcome.code, outcome.stderr);
+		throw new CommandCliError(detail, outcome.code, outcome.stderr);
 	}
 	return outcome.stdout;
 }

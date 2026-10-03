@@ -8,8 +8,10 @@ tab explains the code.
 
 ## Prerequisites
 
-- `omp` running inside a herdr pane (`HERDR_ENV=1`) — outside herdr the
-  extension registers but does nothing.
+- `omp` running as the **main agent session, in TUI mode, inside a herdr pane**
+  (`HERDR_ENV=1`). Subagents and headless runs (`-p`, rpc/SDK) stay inert, and
+  outside herdr a main TUI session reports the skipped launch at startup.
+  Explicit `/diff` and tool calls also explain why the companion is unavailable.
 - `hunk` on PATH (verified against 0.22.0), `herdr` on PATH or
   `HERDR_BIN_PATH` (verified against 0.9.3), and `git`.
 - A git repository with at least one commit; the checkout root is the
@@ -45,8 +47,9 @@ automatic discovery. Disable with `disabledExtensions: ["extension-module:hunk"]
   - **Specific commit** — one pinned commit (`hunk show <sha>`).
   Canceling any selector changes nothing. Non-argument policy: `/diff` takes no
   arguments. After a completed selection the companion is (re)opened if needed,
-  reloaded, and focused. A closed companion stays closed until you complete a
-  `/diff` selection.
+  reloaded, and focused. A companion you closed stays closed until you
+  complete a `/diff` selection (leaving git entirely is different — see
+  Lifecycle).
 - **Two-way annotations.** Your inline notes in Hunk (the `c` action) are the
   feedback channel; the agent pulls them on demand with `hunk_review` and can
   reply in-thread or leave rationale notes with `hunk_comment`. Saving a note
@@ -63,12 +66,18 @@ automatic discovery. Disable with `disabledExtensions: ["extension-module:hunk"]
 
 - A new omp session starts the companion with **fresh annotations**: notes from
   the previous session in that companion are cleared (`comment clear --all`)
-  once, at the boundary. Within a session, edits and scope changes never
-  intentionally delete notes.
-- Leaving the checkout (e.g. `/move` to another worktree) retires the review
-  process cleanly and relaunches it for the new root with a new session id;
-  archives stay under the same omp session. If the pane is busy with an
-  unrelated process, it is left untouched and reported.
+  once, at the boundary. If that reset fails, annotations stay disabled until
+  a completed `/diff` selection retries it successfully. Ordinary edits and
+  scope changes do not clear notes.
+- Moving between checkouts/worktrees (e.g. `/move`) relaunches the review
+  process for the new root with a new session id; archives stay under the same
+  omp session. If the pane is busy with an unrelated process, it is left
+  untouched and reported; a completed `/diff` can open a new companion tab
+  without sending any input to the blocked pane.
+- Leaving git entirely parks the companion: the tab and its last review stay
+  open, while annotations and archiving pause. It reopens on its own when you
+  return to a git checkout — unlike a tab you closed deliberately, which stays
+  closed until you complete a `/diff` selection.
 - On omp exit the companion tab stays open for review.
 - If you close the tab, the extension respects that for the rest of the omp
   session (tools will tell you to use `/diff`); a fresh omp session may reopen
@@ -77,8 +86,10 @@ automatic discovery. Disable with `disabledExtensions: ["extension-module:hunk"]
 ## State files
 
 - Ownership record (which pane/tab the extension created, keyed by herdr
-  socket + workspace): `${XDG_STATE_HOME}/more-bwoah/hunk/<hash>.json`
-  (mode 0600). This is pairing metadata only — never notes.
+  socket + workspace): `$XDG_STATE_HOME/more-bwoah/hunk/<hash>.json` when
+  `XDG_STATE_HOME` is set to an absolute path, otherwise
+  `~/.local/state/more-bwoah/hunk/<hash>.json` (mode 0600). This is pairing
+  metadata only — never notes.
 - Rolling archive: `<omp session home>/hunk/review-notes.json`.
 
 Delete the ownership record to make the extension forget a pairing.
@@ -91,10 +102,17 @@ Delete the ownership record to make the extension forget a pairing.
   git checkout with a committed HEAD.
 - **"review not ready yet (timed out)"** — Hunk may still be loading; the tab
   stays and a later health check binds it. `/diff` also re-checks.
+- **Transient herdr/hunk failures** (timeouts, socket errors, malformed
+  replies) are classified as indeterminate, never as "the tab is gone": the
+  extension skips that check and retries on the next lifecycle tick instead of
+  closing a healthy companion or creating a duplicate tab. Only a definitive
+  tab/pane-not-found reply counts as absence.
 - **"owned by another agent pane"** — one main agent owns the workspace
   companion; close the other owner or delete the ownership record.
 - **"could not identify the companion session uniquely"** — something launched
-  a second review in the companion pane; the extension refuses to guess.
-  `/diff` relaunches cleanly.
+  a second review in the companion pane; the extension refuses to guess and
+  never relaunches into that pane. Close the stuck companion tab, then
+  complete a `/diff` selection to launch a fresh companion; deleting the
+  ownership record (see State files) also clears the pairing.
 - **Daemon version mismatch after a `hunk` upgrade** — restart the companion
   via `/diff`; the extension never restarts Hunk's daemon on its own.
