@@ -230,6 +230,7 @@ export interface Harness {
 	ctrlcSent: number;
 	clears: number;
 	focusCount: number;
+	renames: string[];
 	tabCreateCount: number;
 	/** comment add invocations recorded for assertions. */
 	adds: number;
@@ -295,6 +296,7 @@ export function createHerdrHarness(): Harness {
 		ctrlcSent: 0,
 		clears: 0,
 		focusCount: 0,
+		renames: [],
 		tabCreateCount: 0,
 		adds: 0,
 		lastAddArgs: null,
@@ -351,6 +353,14 @@ export function createHerdrHarness(): Harness {
 		call => call.command === "herdr" && call.args[0] === "tab" && call.args[1] === "focus",
 		() => {
 			harness.focusCount += 1;
+			return okJson({ result: {} });
+		},
+	);
+
+	harness.exec.install(
+		call => call.command === "herdr" && call.args[0] === "tab" && call.args[1] === "rename",
+		call => {
+			harness.renames.push(call.args[3] ?? "");
 			return okJson({ result: {} });
 		},
 	);

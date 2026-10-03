@@ -348,4 +348,20 @@ describe("companion identity and lifecycle", () => {
 		await ctx.controller.lifecycleTick();
 		expect(ctx.controller.state).toBe("ready");
 	});
+
+	test("scope change retitles the tab to diff without affecting the reload", async () => {
+		const ctx = await freshContext();
+		cleaners.push(ctx.cleanup);
+		await ctx.controller.initialize();
+		const head = await headSha(ctx.repo.path);
+		await ctx.controller.selectScope({ kind: "commit", commitSha: head });
+
+		expect(ctx.harness.renames).toEqual(["diff"]);
+		const reload = ctx.harness.exec.calls.find(
+			call => call.command === "hunk" && call.args[1] === "reload",
+		);
+		expect(reload?.args).toContain("show");
+		expect(reload?.args).toContain(head);
+		expect(ctx.controller.scope).toEqual({ kind: "commit", commitSha: head });
+	});
 });

@@ -414,6 +414,15 @@ export class CompanionController {
 		await this.#herdr(["tab", "focus", this.#record.tabId], "tab focus");
 	}
 
+	/**
+	 * Retitle the owned tab. Creation labels it "hunk"; a completed /diff
+	 * scope change retitles it "diff" so the tab name reflects the active view.
+	 */
+	async renameTab(label: string): Promise<void> {
+		if (!this.#record) throw new CompanionUnavailable("No companion tab to rename.");
+		await this.#herdr(["tab", "rename", this.#record.tabId, label], "tab rename");
+	}
+
 	// ------------------------------------------------------------- lifecycle --
 
 	/**
@@ -1006,6 +1015,11 @@ export class CompanionController {
 			await this.#cli.reload(this.#binding.hunkSessionId, hunkReloadArgs(scope), { timeoutMs: 5_000 });
 			this.#scope = scope;
 			this.#viewToken = undefined;
+			try {
+				await this.renameTab("diff");
+			} catch (error) {
+				this.#deps.logger.warn("tab rename after scope change failed", { error });
+			}
 			await this.snapshotNow({ deadlineMs: 3_000 });
 		});
 	}

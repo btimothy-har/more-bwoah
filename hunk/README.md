@@ -32,7 +32,8 @@ automatic discovery. Disable with `disabledExtensions: ["extension-module:hunk"]
   extension creates a background `hunk` tab labeled `hunk` in your workspace
   and binds the exact session id it registers — by process id, not by label or
   repo path, so unrelated Hunk windows on the same checkout are never touched.
-  The tab is created without stealing focus.
+  The tab is created without stealing focus. Completing a `/diff` selection
+  retitles the tab to `diff` so its name reflects the active view.
 - **`/diff`** — selector-only scope control for the companion:
   - **Full session** — the HEAD captured when this omp session entered the
     checkout, diffed against the live working tree. Includes checkpoint
