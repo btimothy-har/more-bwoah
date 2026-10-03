@@ -111,6 +111,7 @@ export default function hunkCompanionExtension(pi: ExtensionAPI): void {
 			clearInterval: () => undefined,
 			setTimeout: () => undefined,
 			clearTimeout: () => undefined,
+			now: () => Date.now(),
 		},
 		logger: createLogger(pi),
 		notify: (message, level) => runtime.ui?.notify(message, level),
