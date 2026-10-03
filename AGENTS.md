@@ -1,10 +1,7 @@
-# Development Rules
+# more-bwoah
 
 `more-bwoah` is the extension library for the
-[`omp`](https://github.com/btimothy-har/bwoah-my-pi) coding agent. Cross-repo
-facts are injected into sessions via
-`~/.omp/agent/shared-contexts/bwoah-shared-context.md`; this file owns the
-conventions of this repo.
+[`omp`](https://github.com/btimothy-har/bwoah-my-pi) coding agent.
 
 ## Repo layout
 
