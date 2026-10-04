@@ -1,0 +1,9 @@
+{
+  "name": "@more-bwoah/hunk",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "omp": {
+    "extensions": ["./index.ts"]
+  }
+}
