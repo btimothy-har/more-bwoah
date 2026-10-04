@@ -19,14 +19,24 @@ tab explains the code.
 
 ## Install
 
-Point omp at the extension entry (absolute path recommended):
+Install from a durable checkout with omp's native CLI:
+
+```sh
+omp install /absolute/path/to/more-bwoah/hunk
+```
+
+For a local directory, `omp install` links the extension rather than copying
+it, so edits in that checkout propagate. Keep the checkout at that path;
+install from the main checkout after merging, not a temporary worktree you
+intend to remove. Preview without changing anything with `--dry-run`.
+
+For one-off loading without installation:
 
 ```sh
 omp -e /absolute/path/to/more-bwoah/hunk/index.ts
 ```
 
-Or copy/symlink this directory into `~/.omp/agent/extensions/hunk` for
-automatic discovery. Disable with `disabledExtensions: ["extension-module:hunk"]`.
+Disable with `disabledExtensions: ["extension-module:hunk"]`.
 
 ## What you get
 
