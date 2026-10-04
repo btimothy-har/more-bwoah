@@ -112,10 +112,10 @@ export class HerdrCli {
 	}
 
 	/** null means herdr proved the pane is gone; other failures reject. */
-	async paneState(paneId: string): Promise<HerdrPane | null> {
+	async paneState(paneId: string, timeoutMs?: number): Promise<HerdrPane | null> {
 		let result: Record<string, unknown>;
 		try {
-			result = await this.run(["pane", "get", paneId], "pane get");
+			result = await this.run(["pane", "get", paneId], "pane get", timeoutMs);
 		} catch (error) {
 			if (!(error instanceof HerdrAbsentError)) throw error;
 			return null;
@@ -136,14 +136,22 @@ export class HerdrCli {
 		};
 	}
 
-	async paneProcessInfo(paneId: string): Promise<PaneProcessInfo> {
-		const result = await this.run(["pane", "process-info", "--pane", paneId], "pane process-info");
+	async paneProcessInfo(paneId: string, timeoutMs?: number): Promise<PaneProcessInfo> {
+		const result = await this.run(["pane", "process-info", "--pane", paneId], "pane process-info", timeoutMs);
 		const info = asRecord(result["process_info"]);
 		if (!info) {
 			throw new CommandCliError("pane process-info: malformed response", 0, "");
 		}
-		const foreground = info["foreground_processes"];
-		if (!Array.isArray(foreground)) throw new CommandCliError("pane process-info: missing foreground processes", 0, "");
+		if (info["pane_id"] !== paneId) {
+			throw new CommandCliError("pane process-info: malformed identity", 0, "");
+		}
+		// herdr 0.9.3 omits `foreground_processes` when empty; omission means an
+		// empty set, but foreground data that is present must be well-formed.
+		const foregroundValue = info["foreground_processes"];
+		const foreground = foregroundValue === undefined ? [] : foregroundValue;
+		if (!Array.isArray(foreground)) {
+			throw new CommandCliError("pane process-info: malformed foreground processes", 0, "");
+		}
 		const foregroundPids: number[] = [];
 		for (const entry of foreground) {
 			const pid = asRecord(entry)?.["pid"];
@@ -158,6 +166,44 @@ export class HerdrCli {
 		return { shellPid, foregroundPids };
 	}
 
+	/**
+	 * Panes currently in `workspaceId`. Malformed payloads reject so callers
+	 * treat the workspace as indeterminate instead of acting on a partial list.
+	 */
+	async paneList(workspaceId: string, timeoutMs?: number): Promise<HerdrPane[]> {
+		const result = await this.run(["pane", "list", "--workspace", workspaceId], "pane list", timeoutMs);
+		const panes = result["panes"];
+		if (!Array.isArray(panes)) {
+			throw new CommandCliError("pane list: malformed response", 0, "");
+		}
+		const listed: HerdrPane[] = [];
+		for (const entry of panes) {
+			const pane = asRecord(entry);
+			const paneId = pane?.["pane_id"];
+			if (!pane || typeof paneId !== "string") {
+				throw new CommandCliError("pane list: malformed pane entry", 0, "");
+			}
+			const tabId = pane["tab_id"];
+			const entryWorkspaceId = pane["workspace_id"];
+			if ((tabId !== undefined && typeof tabId !== "string") || (entryWorkspaceId !== undefined && typeof entryWorkspaceId !== "string")) {
+				throw new CommandCliError("pane list: malformed pane entry", 0, "");
+			}
+			listed.push({ paneId, tabId, workspaceId: entryWorkspaceId });
+		}
+		return listed;
+	}
+
+	/**
+	 * Resolve only on herdr's structured `ok` reply; `pane_not_found` surfaces
+	 * as HerdrAbsentError and every other outcome rejects as indeterminate.
+	 */
+	async closePane(paneId: string, timeoutMs?: number): Promise<void> {
+		const result = await this.run(["pane", "close", paneId], "pane close", timeoutMs);
+		if (result["type"] !== "ok") {
+			throw new CommandCliError("pane close: unexpected result", 0, JSON.stringify(result).slice(0, 400));
+		}
+	}
+
 	/** `envArgs` carries extra `--env KEY=VALUE` pairs the caller wants passed through. */
 	async tabCreate(
 		workspaceId: string,
@@ -165,7 +211,7 @@ export class HerdrCli {
 		envArgs: string[],
 	): Promise<{ tabId: string; paneId: string }> {
 		const result = await this.run(
-			["tab", "create", "--workspace", workspaceId, "--cwd", repoRoot, "--label", "hunk", "--no-focus", ...envArgs],
+			["tab", "create", "--workspace", workspaceId, "--cwd", repoRoot, "--label", "diff", "--no-focus", ...envArgs],
 			"tab create",
 			10_000,
 		);

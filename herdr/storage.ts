@@ -39,8 +39,28 @@ function isEnoent(error: unknown): boolean {
 	);
 }
 
-/** Stage, verify, and atomically publish one JSON document. */
-export async function atomicWriteJson(filePath: string, value: unknown, mode = 0o600): Promise<void> {
+function stateDirectoryAndHash(env: EnvLike, socketPath: string, workspaceId: string) {
+	const base =
+		env.XDG_STATE_HOME !== undefined && nodePath.isAbsolute(env.XDG_STATE_HOME)
+			? env.XDG_STATE_HOME
+			: nodePath.join(nodeOs.homedir(), ".local", "state");
+	const hash = new Bun.CryptoHasher("sha256")
+		.update(JSON.stringify([socketPath, workspaceId]))
+		.digest("hex");
+	return { directory: nodePath.join(base, "more-bwoah", "hunk"), hash };
+}
+
+/**
+ * Stage, verify, and atomically publish one JSON document. Returns `true` when
+ * the rename published, `false` when the optional `mayPublish` fence observed
+ * stale caller state and the staged file was discarded instead.
+ */
+export async function atomicWriteJson(
+	filePath: string,
+	value: unknown,
+	mode = 0o600,
+	mayPublish?: () => boolean,
+): Promise<boolean> {
 	const json = `${JSON.stringify(value, null, "\t")}\n`;
 	const expectedBytes = Buffer.byteLength(json);
 	const directory = nodePath.dirname(filePath);
@@ -56,7 +76,12 @@ export async function atomicWriteJson(filePath: string, value: unknown, mode = 0
 			throw new StorageError(`size mismatch after write: ${file.size} of ${expectedBytes} bytes`);
 		}
 		await nodeFs.chmod(tempPath, mode);
+		if (mayPublish && !mayPublish()) {
+			await nodeFs.rm(tempPath, { force: true });
+			return false;
+		}
 		await nodeFs.rename(tempPath, filePath);
+		return true;
 	} catch (error) {
 		await nodeFs.rm(tempPath, { force: true });
 		throw error;
@@ -80,14 +105,19 @@ export async function readJsonFile(filePath: string): Promise<unknown | null> {
 }
 
 export function companionRecordPath(env: EnvLike, socketPath: string, workspaceId: string): string {
-	const base =
-		env.XDG_STATE_HOME !== undefined && nodePath.isAbsolute(env.XDG_STATE_HOME)
-			? env.XDG_STATE_HOME
-			: nodePath.join(nodeOs.homedir(), ".local", "state");
-	const key = new Bun.CryptoHasher("sha256")
-		.update(JSON.stringify([socketPath, workspaceId]))
-		.digest("hex");
-	return nodePath.join(base, "more-bwoah", "hunk", `${key}.json`);
+	const { directory, hash } = stateDirectoryAndHash(env, socketPath, workspaceId);
+	return nodePath.join(directory, `${hash}.json`);
+}
+
+/**
+ * Persistent primary-role lock pathname for the same socket/workspace key as
+ * `companionRecordPath()`. The file at this path is a flock inode owned by the
+ * native handle: never unlink, rename, or truncate it, or two primaries can
+ * hold it at once. Its contents carry no meaning.
+ */
+export function primaryRoleLockPath(env: EnvLike, socketPath: string, workspaceId: string): string {
+	const { directory, hash } = stateDirectoryAndHash(env, socketPath, workspaceId);
+	return nodePath.join(directory, `${hash}.primary.lock`);
 }
 
 function requireText(value: unknown, field: string, filePath: string): string {
