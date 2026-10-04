@@ -5,16 +5,23 @@
 
 ## Repo layout
 
-One extension per top-level directory, consumed by `omp`'s extension loader:
+One installable extension package per top-level directory:
 
-- `<name>/index.ts` — default-exports a factory `(pi: ExtensionAPI) => void | Promise<void>`
-- or `<name>/package.json` with an `omp`/`pi` → `extensions: [...]` manifest
-  for multi-file extensions
+- `<name>/index.ts` — default-exports a factory `(pi: ExtensionAPI) => void | Promise<void>`.
+- `<name>/package.json` — required even for a single-file extension. Include a
+  unique package `name` (`@more-bwoah/<name>`), a `version`, `"private": true`,
+  `"type": "module"`, and `"omp": { "extensions": ["./index.ts"] }`.
+  Declare every entry explicitly; helper/test files are not entry points.
+- Keep extension-specific helpers, tests, and assets inside that directory.
+
+Bare `index.ts` discovery and explicit `omp -e` loading can work without a
+manifest, but `omp install <directory>` requires `package.json`. Verify new
+packages with a real install and startup in an isolated home/profile; the
+installer's `--dry-run` only previews actions and does not validate the package.
 
 Loading is one level deep and symlink-friendly. The extension API surface and
 loader behavior are documented in the `omp` repo (`docs/extensions.md`,
-`docs/extension-loading.md`) — consult them when needed; nothing here mirrors
-them.
+`docs/extension-loading.md`) — consult them when needed.
 
 ## Conventions
 

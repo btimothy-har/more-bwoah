@@ -25,10 +25,13 @@ Install from a durable checkout with omp's native CLI:
 omp install /absolute/path/to/more-bwoah/hunk
 ```
 
+The extension directory includes the `package.json` required by the installer;
+its `omp.extensions` manifest declares `index.ts` as the entry point.
 For a local directory, `omp install` links the extension rather than copying
 it, so edits in that checkout propagate. Keep the checkout at that path;
 install from the main checkout after merging, not a temporary worktree you
-intend to remove. Preview without changing anything with `--dry-run`.
+intend to remove. `--dry-run` previews the action but does not validate the
+package or prove that installation succeeds.
 
 For one-off loading without installation:
 
