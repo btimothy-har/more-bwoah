@@ -10,6 +10,8 @@
 import * as nodeFs from "node:fs/promises";
 import * as nodeOs from "node:os";
 import * as nodePath from "node:path";
+import type { EnvLike } from "../contracts";
+import { isEnoent } from "../boundary";
 
 export interface CompanionRecord {
 	version: 1;
@@ -29,14 +31,6 @@ export class StorageError extends Error {
 		super(message);
 		this.name = "StorageError";
 	}
-}
-
-type EnvLike = Record<string, string | undefined>;
-
-function isEnoent(error: unknown): boolean {
-	return (
-		typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT"
-	);
 }
 
 function stateDirectoryAndHash(env: EnvLike, socketPath: string, workspaceId: string) {

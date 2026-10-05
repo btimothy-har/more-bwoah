@@ -13,7 +13,7 @@
  * tab.
  */
 
-import { CommandCliError, type ExecOutcome, type ExecRunner } from "./hunk-cli";
+import { CommandCliError, type ExecOutcome, type ExecRunner } from "./exec";
 import { asRecord } from "./boundary";
 
 export interface HerdrPane {

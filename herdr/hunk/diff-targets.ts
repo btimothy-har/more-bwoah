@@ -10,8 +10,8 @@
  * - commit scope pins one commit (`hunk show <sha>`), immune to HEAD movement.
  */
 
-import { canonicalPath } from "./boundary";
-import { CommandCliError, type ExecRunner } from "./hunk-cli";
+import { canonicalPath } from "../boundary";
+import { CommandCliError, type ExecRunner } from "../exec";
 
 export type ReviewScope =
 	| { kind: "session"; baseSha: string }

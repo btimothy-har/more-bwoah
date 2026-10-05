@@ -49,17 +49,18 @@ import * as nodeFs from "node:fs/promises";
 import * as nodePath from "node:path";
 import {
 	CommandCliError,
-	CompanionUnavailable,
-	HunkCli,
-	type CommentAddRequest,
-	type CommentAddResult,
 	type ExecRunner,
-	type RegisteredSession,
-	type ReviewPublication,
-	type SessionSnapshot,
-} from "./hunk-cli";
-import { HerdrAbsentError, HerdrCli, HerdrRejectedError, type HerdrPane, type PaneProcessInfo } from "./herdr-cli";
-import { asRecord, canonicalPath } from "./boundary";
+} from "../exec";
+import {
+	CompanionUnavailable,
+	type CompanionLogger,
+	type CompanionTimers,
+	type EnvLike,
+	type NotifyLevel,
+} from "../contracts";
+import { HunkCli, type CommentAddRequest, type CommentAddResult, type RegisteredSession, type ReviewPublication, type SessionSnapshot } from "./cli";
+import { HerdrAbsentError, HerdrCli, HerdrRejectedError, type HerdrPane, type PaneProcessInfo } from "../herdr-cli";
+import { asRecord, canonicalPath, isEnoent } from "../boundary";
 import {
 	hunkReloadArgs,
 	resolveCheckout,
@@ -76,34 +77,13 @@ import {
 	writeCompanionRecord,
 	type CompanionRecord,
 } from "./storage";
-import type { ControllerRole, PrimaryLock, PrimaryLockFactory } from "./primary-lock";
-
-export type { ControllerRole } from "./primary-lock";
-export type EnvLike = Record<string, string | undefined>;
+import type { ControllerRole, PrimaryLock, PrimaryLockFactory } from "../primary-lock";
 
 export const SECONDARY_INACTIVE_MESSAGE = "Herdr integration is inactive in this secondary omp session.";
 export const PENDING_OWNERSHIP_MESSAGE = "Herdr integration is waiting for workspace ownership.";
 const SHUTDOWN_MESSAGE = "Herdr integration is shutting down.";
 const PANE_IDENTITY_BLOCKED_MESSAGE =
 	"Herdr: this controller's pane identity changed; review controls are paused.";
-
-export interface CompanionTimers {
-	setInterval(callback: () => void, ms: number): unknown;
-	clearInterval(handle: unknown): void;
-	setTimeout(callback: () => void, ms: number): unknown;
-	clearTimeout(handle: unknown): void;
-	/** Monotonic-enough wall clock; injectable so tests control deadlines. */
-	now(): number;
-}
-
-export interface CompanionLogger {
-	debug(message: string, detail?: unknown): void;
-	info(message: string, detail?: unknown): void;
-	warn(message: string, detail?: unknown): void;
-	error(message: string, detail?: unknown): void;
-}
-
-export type NotifyLevel = "info" | "warning" | "error";
 
 export interface CompanionDeps {
 	exec: ExecRunner;
@@ -237,10 +217,6 @@ export function eligibleEnv(env: EnvLike): boolean {
 
 function shellQuote(value: string): string {
 	return `'${value.replaceAll("'", `'\\''`)}'`;
-}
-
-function isEnoent(error: unknown): boolean {
-	return typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
 }
 
 /**

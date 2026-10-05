@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { HerdrAbsentError, HerdrCli, HerdrRejectedError } from "./herdr-cli";
-import { CommandCliError, type ExecOutcome, type ExecRunner, type ExecRunnerOptions } from "./hunk-cli";
+import { CommandCliError, type ExecOutcome, type ExecRunner, type ExecRunnerOptions } from "./exec";
 
 interface FakeCall {
 	args: string[];

@@ -10,7 +10,7 @@
 
 import * as nodeFs from "node:fs/promises";
 import * as nodePath from "node:path";
-import type { CompanionLogger } from "./companion";
+import type { CompanionLogger } from "./contracts";
 
 /** Admission outcome for one omp process in a Herdr workspace. */
 export type ControllerRole = "pending" | "primary" | "secondary";

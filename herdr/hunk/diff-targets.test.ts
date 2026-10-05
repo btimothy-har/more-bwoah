@@ -10,7 +10,7 @@ import {
 	resolveCheckout,
 	resolveCommitSha,
 } from "./diff-targets";
-import { FakeExec, canon, createTempRepo, headSha, type GitFixture } from "./test-helpers";
+import { FakeExec, canon, createTempRepo, headSha, type GitFixture } from "../test-helpers";
 
 const cleaners: Array<() => Promise<void>> = [];
 afterEach(async () => {

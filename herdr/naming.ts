@@ -9,7 +9,7 @@
  * diff child is named once at creation and is never retouched here.
  */
 
-import type { CompanionLogger } from "./companion";
+import type { CompanionLogger } from "./contracts";
 import { HerdrCli } from "./herdr-cli";
 
 const AGENT_TAB_LABEL = "omp";

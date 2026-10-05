@@ -9,7 +9,7 @@ import {
 	type CompanionDeps,
 	type ParentSnapshot,
 } from "./companion";
-import type { ExecOutcome } from "./hunk-cli";
+import type { ExecOutcome } from "../exec";
 import { companionRecordPath, primaryRoleLockPath, type CompanionRecord } from "./storage";
 import {
 	FakeTimers,
@@ -31,7 +31,7 @@ import {
 	type Harness,
 	type HarnessLocks,
 	type HarnessSession,
-} from "./test-helpers";
+} from "../test-helpers";
 
 interface TestContext {
 	harness: Harness;

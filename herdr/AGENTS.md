@@ -2,9 +2,9 @@
 
 Supplements the repository-root `AGENTS.md`; read that first. Product usage
 lives in [README.md](./README.md); model-facing instructions live in
-[guidance.md](./guidance.md) — imported as static text by `index.ts` and
-injected only for ready primaries; link to those files instead of duplicating
-their content.
+[hunk/guidance.md](./hunk/guidance.md) — imported as static text by `index.ts`
+and injected only for ready primaries; link to those files instead of
+duplicating their content.
 
 ## Module map
 
@@ -16,12 +16,12 @@ their content.
   runtime handlers (`pi.exec` throws before `ExtensionRunner.initialize`).
   `session_start` starts one-time own-tab naming and admission independently;
   a naming failure never blocks admission.
-- `companion.ts` — `CompanionController`: role admission, the one serialized
-  reconciliation drain (revision-bearing `ParentSnapshot`), the launch-intent
-  sidecar schema and sidecar-guarded launch, verified child replacement,
-  identity handshakes (PID∩registry + controller pane reservation),
-  readiness/clean-note gating, stable review capture, view tokens, snapshot
-  writer, soft shutdown.
+- `hunk/companion.ts` — `CompanionController`: role admission, the one
+  serialized reconciliation drain (revision-bearing `ParentSnapshot`), the
+  launch-intent sidecar schema and sidecar-guarded launch, verified child
+  replacement, identity handshakes (PID∩registry + controller pane
+  reservation), readiness/clean-note gating, stable review capture, view
+  tokens, snapshot writer, soft shutdown.
 - `primary-lock.ts` — adapter over the host's native process-owned `FileLock`
   (`@oh-my-pi/pi-natives`, dynamically imported; no fallback). A winning
   handle is strongly referenced and released at actual process exit; losing
@@ -33,15 +33,21 @@ their content.
   response validation (absent `foreground_processes` normalizes to `[]`,
   malformed present data rejects), and proven-absence classification; other
   failures stay indeterminate.
-- `hunk-cli.ts` — typed `hunk session …` wrappers (envelope parsing, exit-code
+- `hunk/cli.ts` — typed `hunk session …` wrappers (envelope parsing, exit-code
   mapping). Always targets the captured positional session id; never `--repo`.
-- `diff-targets.ts` — git queries and `ReviewScope` → reload argv.
-- `boundary.ts` — shared `asRecord`/`canonicalPath` guards for external JSON
-  payloads and paths; import them, never re-copy.
-- `storage.ts` — atomic JSON writes (stage → verify → chmod → rename, with a
-  `mayPublish` recheck immediately before rename), record schema v1, record
-  path and `primaryRoleLockPath` (same state directory and hash as the record,
-  `.primary.lock` suffix).
+- `hunk/diff-targets.ts` — git queries and `ReviewScope` → reload argv.
+- `boundary.ts` — shared `asRecord`/`canonicalPath`/`isEnoent` guards for
+  external JSON payloads, paths, and absent-file errors; import them, never
+  re-copy.
+- `exec.ts` — CLI-neutral execution vocabulary (`ExecOutcome`,
+  `ExecRunnerOptions`, `ExecRunner`, `CommandCliError`); imports nothing.
+- `contracts.ts` — shared injected-runtime contracts (`EnvLike`,
+  `CompanionTimers`, `CompanionLogger`, `NotifyLevel`) and the
+  `CompanionUnavailable` gate error; imports nothing.
+- `hunk/storage.ts` — atomic JSON writes (stage → verify → chmod → rename,
+  with a `mayPublish` recheck immediately before rename), record schema v1,
+  record path and `primaryRoleLockPath` (same state directory and hash as the
+  record, `.primary.lock` suffix).
 
 ## Invariants
 
@@ -113,11 +119,11 @@ their content.
 ## Verification
 
 - `bun test herdr` from the checkout root — behavioral suites
-  (`companion.test.ts`, `diff-targets.test.ts`, `feedback.test.ts`,
-  `storage.test.ts`, `naming.test.ts`, `herdr-cli.test.ts`) use real temp git
-  repos, fake timers, and injectable command runners, including the factory
-  lock harness (`createHerdrExtension(harness.tryPrimaryLock)`). Assert
-  consumer-visible outcomes, not registration counts or source text.
+  (`hunk/companion.test.ts`, `hunk/diff-targets.test.ts`, `feedback.test.ts`,
+  `hunk/storage.test.ts`, `naming.test.ts`, `herdr-cli.test.ts`) use real temp
+  git repos, fake timers, and injectable command runners, including the
+  factory lock harness (`createHerdrExtension(harness.tryPrimaryLock)`).
+  Assert consumer-visible outcomes, not registration counts or source text.
 - Before release: the disposable-workspace installed-binary smoke, against a
   scratch Herdr server/home/state and scratch git repos only — never the
   user's live panes, daemon, or config. Condensed checklist:

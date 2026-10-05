@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { HerdrCli } from "./herdr-cli";
 import { SessionNaming } from "./naming";
-import type { ExecOutcome } from "./hunk-cli";
+import type { ExecOutcome } from "./exec";
 
 describe("naming shutdown", () => {
 	for (const action of ["tab", "title"] as const) {
