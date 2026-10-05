@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import * as nodeFs from "node:fs/promises";
+import * as nodeFsSync from "node:fs";
 import * as nodeOs from "node:os";
 import * as nodePath from "node:path";
 import {
@@ -7,6 +8,7 @@ import {
 	atomicWriteJson,
 	companionRecordPath,
 	parseCompanionRecord,
+	primaryRoleLockPath,
 	readCompanionRecord,
 	readJsonFile,
 	writeCompanionRecord,
@@ -83,6 +85,70 @@ describe("storage", () => {
 
 		const fallback = companionRecordPath({}, "/s", "w");
 		expect(fallback.startsWith(nodePath.join(nodeOs.homedir(), ".local", "state", "more-bwoah", "hunk"))).toBe(true);
+	});
+
+	test("primaryRoleLockPath mirrors the record key as a persistent .primary.lock inode", () => {
+		const env = { XDG_STATE_HOME: "/tmp/state-home" };
+		const lockPath = primaryRoleLockPath(env, "/sock-1", "w1");
+		expect(nodePath.dirname(lockPath)).toBe(nodePath.dirname(companionRecordPath(env, "/sock-1", "w1")));
+		expect(lockPath.endsWith(".primary.lock")).toBe(true);
+
+		// Role identity is the pathname: stable across calls, distinct per
+		// socket/workspace, and resolved from the same state base as records.
+		expect(primaryRoleLockPath(env, "/sock-1", "w1")).toBe(lockPath);
+		expect(primaryRoleLockPath(env, "/sock-2", "w1")).not.toBe(lockPath);
+		expect(primaryRoleLockPath(env, "/sock-1", "w2")).not.toBe(lockPath);
+		const fallback = primaryRoleLockPath({}, "/s", "w");
+		expect(fallback.startsWith(nodePath.join(nodeOs.homedir(), ".local", "state", "more-bwoah", "hunk"))).toBe(true);
+		expect(fallback.endsWith(".primary.lock")).toBe(true);
+	});
+
+	test("atomicWriteJson publishes and reports success when the fence passes or is absent", async () => {
+		const dir = await tempDir();
+		const filePath = nodePath.join(dir, "fenced.json");
+
+		expect(await atomicWriteJson(filePath, { v: 1 })).toBe(true);
+		expect(JSON.parse(await nodeFs.readFile(filePath, "utf8"))).toEqual({ v: 1 });
+
+		let fenceChecks = 0;
+		expect(await atomicWriteJson(filePath, { v: 2 }, 0o600, () => {
+			fenceChecks += 1;
+			return true;
+		})).toBe(true);
+		expect(fenceChecks).toBe(1);
+		expect(JSON.parse(await nodeFs.readFile(filePath, "utf8"))).toEqual({ v: 2 });
+	});
+
+	test("atomicWriteJson publication fence discards stale staged data and preserves the destination", async () => {
+		const dir = await tempDir();
+		const filePath = nodePath.join(dir, "fenced.json");
+		await atomicWriteJson(filePath, { newer: true });
+
+		// The fence must observe the staged temp file (post-chmod, pre-rename).
+		let sawStagedSibling = false;
+		expect(await atomicWriteJson(filePath, { stale: true }, 0o600, () => {
+			sawStagedSibling = nodeFsSync.readdirSync(dir).some(name => name.includes(".tmp-"));
+			return false;
+		})).toBe(false);
+		expect(sawStagedSibling).toBe(true);
+		expect(JSON.parse(await nodeFs.readFile(filePath, "utf8"))).toEqual({ newer: true });
+		const leftovers = (await nodeFs.readdir(dir)).filter(name => name.includes(".tmp-"));
+		expect(leftovers).toEqual([]);
+	});
+
+	test("atomicWriteJson fence failure aborts publication and leaves the destination intact", async () => {
+		const dir = await tempDir();
+		const filePath = nodePath.join(dir, "fenced.json");
+		await atomicWriteJson(filePath, { good: true });
+
+		await expect(
+			atomicWriteJson(filePath, { doomed: true }, 0o600, () => {
+				throw new Error("caller observed a newer parent revision");
+			}),
+		).rejects.toThrow("caller observed a newer parent revision");
+		expect(JSON.parse(await nodeFs.readFile(filePath, "utf8"))).toEqual({ good: true });
+		const leftovers = (await nodeFs.readdir(dir)).filter(name => name.includes(".tmp-"));
+		expect(leftovers).toEqual([]);
 	});
 
 	test("record round-trip validates shape and rejects malformed records", async () => {

@@ -4,9 +4,11 @@
  */
 
 import * as nodeFs from "node:fs/promises";
+import * as nodeFsSync from "node:fs";
 import * as nodeOs from "node:os";
 import * as nodePath from "node:path";
 import type { ExecOutcome, ExecRunner, ExecRunnerOptions } from "./hunk-cli";
+import type { PrimaryLockFactory } from "./primary-lock";
 
 export interface RecordedCall {
 	command: string;
@@ -191,6 +193,10 @@ export async function createTempRepo(seedLines: string[]): Promise<GitFixture> {
 	await run(["init", "-b", "main"]);
 	await run(["config", "user.email", "test@example.com"]);
 	await run(["config", "user.name", "Test"]);
+	// The developer's global config may enable commit signing and hooks; both
+	// hang or fail in tests. Local settings override the global ones.
+	await run(["config", "commit.gpgsign", "false"]);
+	await run(["config", "core.hooksPath", "/dev/null"]);
 	await Bun.write(nodePath.join(repoPath, "seed.txt"), `${seedLines.join("\n")}\n`);
 	await run(["add", "."]);
 	await run(["commit", "-m", "seed commit"]);
@@ -224,6 +230,8 @@ export interface HarnessSession {
 	repoRoot: string;
 	generation: string;
 	stateRevision: number;
+	/** Live review notes owned by this Hunk session; clear removes exactly these. */
+	notes: unknown[];
 }
 
 export interface HarnessPane {
@@ -249,7 +257,6 @@ export interface Harness {
 	/** comment add invocations recorded for assertions. */
 	adds: number;
 	lastAddArgs: string[] | null;
-	reviewNotes: unknown[];
 	/** When true, comment add bumps the session's publication generation. */
 	bumpGenerationOnAdd: boolean;
 	/** Repo root assigned to sessions created by a pane-run launch. */
@@ -280,6 +287,26 @@ export interface Harness {
 	/** When true, comment add replies only once commentAddGate is resolved. */
 	hangCommentAdd: boolean;
 	commentAddGate: ((outcome: ExecOutcome) => void) | null;
+	/** When true, comment clear replies only once commentClearGate is resolved. */
+	hangCommentClear: boolean;
+	/** Resuming the pending clear: success applies the removal, failure leaves notes. */
+	commentClearGate: ((outcome: ExecOutcome) => void) | null;
+	releaseCommentClear(): void;
+	/** When true, herdr pane close replies only once closeGate is resolved. */
+	hangClose: boolean;
+	/** Resuming the pending close: success removes the targeted pane and its foregrounded Hunk sessions. */
+	closeGate: ((outcome: ExecOutcome) => void) | null;
+	releaseClose(): void;
+	/** Shared admission-lock table; pass one instance to several rigs to model one workspace. */
+	locks: HarnessLocks;
+	/** The table's PrimaryLockFactory; production wiring receives exactly this under tests. */
+	tryPrimaryLock: PrimaryLockFactory;
+	/** Mark a simulated process dead: harness.isProcessAlive then reports false for it. */
+	killProcess(pid: number): void;
+	/** Liveness for injected CompanionDeps: minted+alive → true, killed → false, never-minted → "unknown". */
+	isProcessAlive(pid: number): boolean | "unknown";
+	/** Structured tab/pane rename record: which id was retargeted to which label. */
+	renameCalls: Array<{ scope: "tab" | "pane"; id: string; label: string }>;
 	addSession(repoRoot: string, paneId: string): HarnessSession;
 }
 
@@ -287,14 +314,30 @@ export interface HarnessEnv {
 	HERDR_ENV: "1";
 	HERDR_WORKSPACE_ID: string;
 	HERDR_PANE_ID: string;
+	/** Own-tab identity proof the controller verifies before child mutation. */
+	HERDR_TAB_ID: string;
 	HERDR_SOCKET_PATH: string;
 	HERDR_BIN_PATH: string;
 	XDG_STATE_HOME: string;
+	/** Pinned to "not nested": an inherited host OMPCODE=1 would make every rig inert. */
+	OMPCODE: "";
 	[key: string]: string | undefined;
 }
 
 function okJson(value: unknown): { stdout: string; stderr: string; code: number; killed: boolean } {
 	return { stdout: JSON.stringify(value), stderr: "", code: 0, killed: false };
+}
+
+/** Numeric suffix of a harness pane id (`w1:p12` → 12); non-numeric ids never raise the floor. */
+function paneNumber(paneId: string): number {
+	const match = /(\d+)$/.exec(paneId);
+	return match === null ? Number.NaN : Number.parseInt(match[1] ?? "", 10);
+}
+
+/** Value of a joined `--option=value` argument, mirroring the hunk CLI's flag parsing. */
+function joinedArg(args: string[], option: string): string | undefined {
+	const prefix = `${option}=`;
+	return args.find(arg => arg.startsWith(prefix))?.slice(prefix.length);
 }
 
 export function harnessFail(stderr: string): { stdout: string; stderr: string; code: number; killed: boolean } {
@@ -329,19 +372,80 @@ export function killedOutcome(): ExecOutcome {
 export const HARNESS_SOCKET = "/tmp/herdr-test.sock";
 export const HARNESS_WORKSPACE = "w1";
 export const HARNESS_AGENT_PANE = "w1:p0";
+export const HARNESS_AGENT_TAB = "w1:t0";
+
+export interface HarnessLocks {
+	/** PrimaryLockFactory over the shared in-memory table. */
+	tryPrimaryLock: PrimaryLockFactory;
+	/**
+	 * Simulate the owning controller process actually exiting: the path frees
+	 * the way a native flock does at process death — without any release()
+	 * call. session_shutdown must never produce this event.
+	 */
+	simulateProcessExit(lockPath: string): void;
+	/** Make acquire attempts reject (native/import/filesystem failure) until cleared with null. */
+	failAcquires(error: Error | null): void;
+	/** Whether some live handle currently holds the path. */
+	holds(lockPath: string): boolean;
+}
+
+export function createHarnessLocks(): HarnessLocks {
+	type Owner = { token: symbol };
+	const owners = new Map<string, Owner>();
+	let acquireError: Error | null = null;
+	const tryPrimaryLock: PrimaryLockFactory = async path => {
+		// The host adapter creates the state directory (mode 0700) before
+		// acquiring; downstream record/sidecar persistence depends on it. The
+		// fake performs the same effect synchronously so admission settles in
+		// microtasks and tests can drain it with turn flushing alone.
+		nodeFsSync.mkdirSync(nodePath.dirname(path), { recursive: true, mode: 0o700 });
+		if (acquireError !== null) throw acquireError;
+		const holder = owners.get(path);
+		if (holder !== undefined) {
+			// Losing handle: release is an idempotent no-op that can never free a
+			// winner's or successor's reservation.
+			return { acquired: false, release() {} };
+		}
+		const token = Symbol(path);
+		owners.set(path, { token });
+		return {
+			acquired: true,
+			release() {
+				const current = owners.get(path);
+				if (current !== undefined && current.token === token) owners.delete(path);
+			},
+		};
+	};
+	return {
+		tryPrimaryLock,
+		simulateProcessExit(path) {
+			owners.delete(path);
+		},
+		failAcquires(error) {
+			acquireError = error;
+		},
+		holds(path) {
+			return owners.has(path);
+		},
+	};
+}
 
 export function harnessEnv(stateDir: string): HarnessEnv {
 	return {
 		HERDR_ENV: "1",
 		HERDR_WORKSPACE_ID: HARNESS_WORKSPACE,
 		HERDR_PANE_ID: HARNESS_AGENT_PANE,
+		HERDR_TAB_ID: HARNESS_AGENT_TAB,
 		HERDR_SOCKET_PATH: HARNESS_SOCKET,
 		HERDR_BIN_PATH: "herdr",
 		XDG_STATE_HOME: stateDir,
+		OMPCODE: "",
 	};
 }
 
-export function createHerdrHarness(): Harness {
+export function createHerdrHarness(locks: HarnessLocks = createHarnessLocks()): Harness {
+	const deadPids = new Set<number>();
+	let nextPaneNumber = 0;
 	const harness: Harness = {
 		exec: new FakeExec(),
 		timers: new FakeTimers(),
@@ -355,10 +459,10 @@ export function createHerdrHarness(): Harness {
 		clears: 0,
 		focusCount: 0,
 		renames: [],
+		renameCalls: [],
 		tabCreateCount: 0,
 		adds: 0,
 		lastAddArgs: null,
-		reviewNotes: [],
 		bumpGenerationOnAdd: false,
 		repoRootForLaunch: "/repo",
 		duplicateLaunch: false,
@@ -380,6 +484,26 @@ export function createHerdrHarness(): Harness {
 		},
 		hangCommentAdd: false,
 		commentAddGate: null,
+		hangCommentClear: false,
+		commentClearGate: null,
+		releaseCommentClear: () => {
+			harness.commentClearGate?.(okJson({ result: {} }));
+		},
+		hangClose: false,
+		closeGate: null,
+		releaseClose: () => {
+			harness.closeGate?.(okJson({ result: { type: "ok" } }));
+		},
+		locks,
+		tryPrimaryLock: locks.tryPrimaryLock,
+		killProcess: pid => {
+			deadPids.add(pid);
+		},
+		isProcessAlive: pid => {
+			if (deadPids.has(pid)) return false;
+			if (Number.isInteger(pid) && pid > 0 && pid <= harness.nextPid) return true;
+			return "unknown";
+		},
 		addSession: (repoRoot, paneId) => {
 			const pid = ++harness.nextPid;
 			const session: HarnessSession = {
@@ -389,6 +513,7 @@ export function createHerdrHarness(): Harness {
 				repoRoot,
 				generation: "gen-1",
 				stateRevision: 1,
+				notes: [],
 			};
 			harness.sessions.push(session);
 			const pane = harness.panes.get(paneId);
@@ -398,12 +523,27 @@ export function createHerdrHarness(): Harness {
 		pendingSessionGetPayload: null,
 	};
 
+	// The omp controller's own pane always exists: its foreground pid is this
+	// very test process, matching the factory's real controllerPid proof.
+	harness.panes.set(HARNESS_AGENT_PANE, { tabId: HARNESS_AGENT_TAB, shellPid: ++harness.nextPid, foreground: [process.pid] });
+
 	harness.exec.install(
 		call => call.command === "herdr" && call.args[0] === "tab" && call.args[1] === "create",
-		() => {
+		call => {
 			harness.tabCreateCount += 1;
-			const tabId = `w1:t${harness.panes.size + 1}`;
-			const paneId = `${tabId.replace("t", "p")}`;
+			const workspaceFlag = call.args.indexOf("--workspace");
+			const workspaceId = workspaceFlag >= 0 ? (call.args[workspaceFlag + 1] ?? HARNESS_WORKSPACE) : HARNESS_WORKSPACE;
+			// herdr never reuses pane ids: allocate past every id ever minted and
+			// past hand-seeded panes, so a closed pane's id cannot collide with a
+			// freshly created one.
+			const seededMax = [...harness.panes.keys()].reduce((max, paneId) => {
+				const suffix = paneNumber(paneId);
+				return Number.isNaN(suffix) ? max : Math.max(max, suffix);
+			}, nextPaneNumber);
+			const nth = seededMax + 1;
+			nextPaneNumber = nth;
+			const tabId = `${workspaceId}:t${nth}`;
+			const paneId = `${workspaceId}:p${nth}`;
 			const shellPid = ++harness.nextPid;
 			harness.panes.set(paneId, { tabId, shellPid, foreground: [] });
 			return okJson({
@@ -436,7 +576,33 @@ export function createHerdrHarness(): Harness {
 		call => call.command === "herdr" && call.args[0] === "tab" && call.args[1] === "rename",
 		call => {
 			harness.renames.push(call.args[3] ?? "");
+			harness.renameCalls.push({ scope: "tab", id: call.args[2] ?? "", label: call.args[3] ?? "" });
 			return okJson({ result: {} });
+		},
+	);
+
+	harness.exec.install(
+		call => call.command === "herdr" && call.args[0] === "pane" && call.args[1] === "rename",
+		call => {
+			harness.renames.push(call.args[3] ?? "");
+			harness.renameCalls.push({ scope: "pane", id: call.args[2] ?? "", label: call.args[3] ?? "" });
+			return okJson({ result: {} });
+		},
+	);
+
+	harness.exec.install(
+		call => call.command === "herdr" && call.args[0] === "pane" && call.args[1] === "list",
+		call => {
+			const workspaceFlag = call.args.indexOf("--workspace");
+			const workspaceId = workspaceFlag >= 0 ? call.args[workspaceFlag + 1] : undefined;
+			const panes = [...harness.panes.entries()]
+				.filter(([paneId]) => workspaceId === undefined || paneId.startsWith(`${workspaceId}:`))
+				.map(([paneId, pane]) => ({
+					pane_id: paneId,
+					tab_id: pane.tabId,
+					workspace_id: paneId.split(":")[0] ?? HARNESS_WORKSPACE,
+				}));
+			return okJson({ result: { panes } });
 		},
 	);
 
@@ -445,11 +611,21 @@ export function createHerdrHarness(): Harness {
 		call => {
 			const pane = harness.panes.get(call.args[3]);
 			if (pane === undefined) return herdrAbsent("pane_not_found");
+			// herdr 0.9.3 echoes the requested pane id and omits
+			// foreground_processes entirely when nothing is foregrounded.
 			return okJson({
 				result: {
 					process_info: {
+						pane_id: call.args[3],
 						shell_pid: pane.shellPid,
-						foreground_processes: pane.foreground.map(pid => ({ pid, name: "hunk" })),
+						...(pane.foreground.length === 0
+							? {}
+							: {
+									foreground_processes: pane.foreground.map(pid => ({
+										pid,
+										name: pid === pane.shellPid ? "zsh" : "hunk",
+									})),
+								}),
 					},
 				},
 			});
@@ -462,7 +638,13 @@ export function createHerdrHarness(): Harness {
 			const pane = harness.panes.get(call.args[2]);
 			if (pane === undefined) return herdrAbsent("pane_not_found");
 			return okJson({
-				result: { pane: { pane_id: call.args[2], tab_id: pane.tabId, workspace_id: HARNESS_WORKSPACE } },
+				result: {
+					pane: {
+						pane_id: call.args[2],
+						tab_id: pane.tabId,
+						workspace_id: call.args[2].split(":")[0] ?? HARNESS_WORKSPACE,
+					},
+				},
 			});
 		},
 	);
@@ -507,6 +689,38 @@ export function createHerdrHarness(): Harness {
 	);
 
 	harness.exec.install(
+		call => call.command === "herdr" && call.args[0] === "pane" && call.args[1] === "close",
+		call => {
+			const pane = harness.panes.get(call.args[2]);
+			if (pane === undefined) return herdrAbsent("pane_not_found");
+			// A completed pane close destroys the targeted pane and the Hunk
+			// sessions that were foregrounded in it — and only those; other
+			// panes, tabs, and sessions are untouched. Killed/failed outcomes
+			// are unknown and change nothing.
+			const complete = (outcome: ExecOutcome): ExecOutcome => {
+				if (outcome.killed || outcome.code !== 0) return outcome;
+				const foreground = pane.foreground;
+				// A completed close destroys everything foregrounded in the pane:
+				// liveness must flip before the pane disappears, or post-close
+				// retirement proofs observe a live PID herdr already killed.
+				for (const pid of foreground) harness.killProcess(pid);
+				harness.sessions = harness.sessions.filter(session => !foreground.includes(session.pid));
+				// herdr never reuses pane ids: raise the allocation floor from the
+				// pane being deleted so a closed hand-seeded pane cannot be re-minted.
+				nextPaneNumber = Math.max(nextPaneNumber, paneNumber(call.args[2] ?? "") || 0);
+				harness.panes.delete(call.args[2]);
+				return okJson({ result: { type: "ok" } });
+			};
+			if (harness.hangClose) {
+				return new Promise<ExecOutcome>(resolve => {
+					harness.closeGate = outcome => resolve(complete(outcome));
+				});
+			}
+			return complete(okJson({ result: { type: "ok" } }));
+		},
+	);
+
+	harness.exec.install(
 		call => call.command === "hunk" && call.args[0] === "session" && call.args[1] === "list",
 		() => {
 			const sessions = harness.registered
@@ -539,9 +753,9 @@ export function createHerdrHarness(): Harness {
 					inputKind: "vcs",
 					snapshot: {
 						state: {
-							liveCommentCount: 0,
+							liveCommentCount: session.notes.length,
 							liveComments: [],
-							reviewNotes: [],
+							reviewNotes: session.notes,
 							...(publication === undefined ? {} : { reviewPublication: publication }),
 						},
 					},
@@ -578,7 +792,7 @@ export function createHerdrHarness(): Harness {
 					title: "review",
 					inputKind: "vcs",
 					files: [{ id: "f1", path: "seed.txt", additions: 1, deletions: 0, hunkCount: 1, hunks: [] }],
-					reviewNotes: harness.reviewNotes,
+					reviewNotes: session.notes,
 					selectedFile: null,
 					selectedHunk: null,
 				},
@@ -598,29 +812,64 @@ export function createHerdrHarness(): Harness {
 	harness.exec.install(
 		call => call.command === "hunk" && call.args[0] === "session" && call.args[2] === "add",
 		call => {
+			const session = harness.sessions.find(entry => entry.sessionId === call.args[3]);
+			if (session === undefined) return harnessFail("No active session matches");
 			harness.adds += 1;
 			harness.lastAddArgs = [...call.args];
+			const settle = (): ExecOutcome => {
+				if (harness.bumpGenerationOnAdd) session.generation = "gen-bumped";
+				const commentId = `mcp:${harness.adds}`;
+				const replyTo = joinedArg(call.args, "--reply-to");
+				session.notes.push({
+					noteId: commentId,
+					...(replyTo !== undefined ? { parentId: replyTo } : {}),
+					source: "agent",
+					body: joinedArg(call.args, "--summary") ?? "",
+				});
+				return okJson({
+					result: {
+						commentId,
+						filePath: joinedArg(call.args, "--file") ?? "seed.txt",
+						hunkIndex: 0,
+						side: "new",
+						line: 2,
+					},
+				});
+			};
 			if (harness.hangCommentAdd) {
 				return new Promise<ExecOutcome>(resolve => {
-					harness.commentAddGate = resolve;
+					harness.commentAddGate = outcome =>
+						resolve(outcome.killed || outcome.code !== 0 ? outcome : settle());
 				});
 			}
-			if (harness.bumpGenerationOnAdd) {
-				const session = harness.sessions.find(entry => entry.sessionId === call.args[3]);
-				if (session !== undefined) session.generation = "gen-bumped";
-			}
-			return okJson({
-				result: { commentId: "mcp:1", filePath: "seed.txt", hunkIndex: 0, side: "new", line: 2 },
-			});
+			return settle();
 		},
 	);
 
 	harness.exec.install(
 		call => call.command === "hunk" && call.args[0] === "session" && call.args[2] === "clear",
-		() => {
+		call => {
+			if (!call.args.includes("--all") || !call.args.includes("--yes")) {
+				return harnessFail("comment clear requires --all and --yes");
+			}
+			const session = harness.sessions.find(entry => entry.sessionId === call.args[3]);
+			if (session === undefined) return harnessFail("No active session matches");
 			if (harness.failClears) return harnessFail("comment clear failed");
-			harness.clears += 1;
-			return okJson({ result: { removedCount: 3 } });
+			// A completed clear removes exactly the requested session's notes and
+			// reports the real removed count; killed/failed outcomes change nothing.
+			const complete = (outcome: ExecOutcome): ExecOutcome => {
+				if (outcome.killed || outcome.code !== 0) return outcome;
+				const removedCount = session.notes.length;
+				session.notes = [];
+				harness.clears += 1;
+				return okJson({ result: { removedCount } });
+			};
+			if (harness.hangCommentClear) {
+				return new Promise<ExecOutcome>(resolve => {
+					harness.commentClearGate = outcome => resolve(complete(outcome));
+				});
+			}
+			return complete(okJson({ result: {} }));
 		},
 	);
 
