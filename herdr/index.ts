@@ -15,24 +15,22 @@
  */
 
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
-import guidance from "./guidance.md" with { type: "text" };
+import guidance from "./hunk/guidance.md" with { type: "text" };
 import {
 	CompanionController,
 	eligibleEnv,
 	PENDING_OWNERSHIP_MESSAGE,
 	SECONDARY_INACTIVE_MESSAGE,
 	type CompanionDeps,
-	type CompanionLogger,
-	type CompanionTimers,
-	type NotifyLevel,
 	type ParentSnapshot,
 	type SessionContext,
-} from "./companion";
+} from "./hunk/companion";
 import { acquireHostPrimaryLock, type PrimaryLockFactory } from "./primary-lock";
 import { SessionNaming } from "./naming";
 import { HerdrCli } from "./herdr-cli";
-import { CompanionUnavailable, CommandCliError } from "./hunk-cli";
-import { listBranches, listRecentCommits, type BranchChoice, type CommitChoice } from "./diff-targets";
+import { CompanionUnavailable, type CompanionLogger, type CompanionTimers, type NotifyLevel } from "./contracts";
+import { CommandCliError } from "./exec";
+import { listBranches, listRecentCommits, type BranchChoice, type CommitChoice } from "./hunk/diff-targets";
 
 const SCOPE_LABELS = {
 	session: "Full session",

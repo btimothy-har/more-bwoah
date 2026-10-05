@@ -8,49 +8,8 @@
  * root and can bind to a different live session.
  */
 
-import { asRecord } from "./boundary";
-
-export interface ExecOutcome {
-	stdout: string;
-	stderr: string;
-	code: number;
-	killed: boolean;
-}
-
-export interface ExecRunnerOptions {
-	cwd?: string;
-	timeoutMs?: number;
-	signal?: AbortSignal;
-}
-
-export type ExecRunner = (
-	command: string,
-	args: string[],
-	options?: ExecRunnerOptions,
-) => Promise<ExecOutcome>;
-
-/**
- * CLI-neutral failure for any wrapped external command (hunk, herdr, git):
- * carries exit code and stderr so callers can classify without instanceof
- * per-CLI hierarchies.
- */
-export class CommandCliError extends Error {
-	constructor(
-		message: string,
-		readonly exitCode: number,
-		readonly stderrText: string,
-	) {
-		super(message);
-		this.name = "CommandCliError";
-	}
-}
-
-export class CompanionUnavailable extends Error {
-	constructor(message: string) {
-		super(message);
-		this.name = "CompanionUnavailable";
-	}
-}
+import { asRecord } from "../boundary";
+import { CommandCliError, type ExecRunner } from "../exec";
 
 export interface RegisteredSession {
 	sessionId: string;

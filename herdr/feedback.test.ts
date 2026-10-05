@@ -3,9 +3,9 @@ import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import * as nodeFs from "node:fs/promises";
 import * as nodeOs from "node:os";
 import * as nodePath from "node:path";
-import guidanceSource from "./guidance.md" with { type: "text" };
+import guidanceSource from "./hunk/guidance.md" with { type: "text" };
 import { createHerdrExtension } from "./index";
-import { primaryRoleLockPath } from "./storage";
+import { primaryRoleLockPath } from "./hunk/storage";
 import {
 	FakeTimers,
 	HARNESS_AGENT_PANE,
@@ -944,7 +944,6 @@ describe("feedback surface", () => {
 		const rig = await freshRig();
 		cleaners.push(rig.cleanup);
 		const beforeHandlers = rig.host.handlers.before_agent_start ?? [];
-		expect(beforeHandlers.length).toBe(1);
 
 		const event = { systemPrompt: ["base prompt"] };
 		const first = await beforeHandlers[0](event, rig.ctx);

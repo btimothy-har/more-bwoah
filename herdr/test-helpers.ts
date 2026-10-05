@@ -7,7 +7,7 @@ import * as nodeFs from "node:fs/promises";
 import * as nodeFsSync from "node:fs";
 import * as nodeOs from "node:os";
 import * as nodePath from "node:path";
-import type { ExecOutcome, ExecRunner, ExecRunnerOptions } from "./hunk-cli";
+import type { ExecOutcome, ExecRunner, ExecRunnerOptions } from "./exec";
 import type { PrimaryLockFactory } from "./primary-lock";
 
 export interface RecordedCall {

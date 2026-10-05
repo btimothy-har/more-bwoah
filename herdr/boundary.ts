@@ -1,8 +1,8 @@
 /**
  * Shared boundary guards for external CLI payloads and filesystem paths.
  *
- * Single source for helpers that were duplicated across hunk-cli.ts,
- * diff-targets.ts, and companion.ts; import instead of re-copying.
+ * Single source for helpers that were duplicated across hunk/cli.ts,
+ * hunk/diff-targets.ts, and hunk/companion.ts; import instead of re-copying.
  */
 
 import * as nodeFs from "node:fs/promises";
@@ -20,4 +20,9 @@ export async function canonicalPath(path: string): Promise<string> {
 	} catch {
 		return path;
 	}
+}
+
+/** Test a caught filesystem error for Node's absent-path code. */
+export function isEnoent(error: unknown): boolean {
+	return typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
 }
