@@ -17,10 +17,11 @@ their content.
   `session_start` starts one-time own-tab naming and admission independently;
   a naming failure never blocks admission.
 - `companion.ts` — `CompanionController`: role admission, the one serialized
-  reconciliation drain (revision-bearing `ParentSnapshot`), verified child
-  replacement and sidecar-guarded launch, identity handshakes
-  (PID∩registry + controller pane reservation), readiness/clean-note gating,
-  stable review capture, view tokens, snapshot writer, soft shutdown.
+  reconciliation drain (revision-bearing `ParentSnapshot`), the launch-intent
+  sidecar schema and sidecar-guarded launch, verified child replacement,
+  identity handshakes (PID∩registry + controller pane reservation),
+  readiness/clean-note gating, stable review capture, view tokens, snapshot
+  writer, soft shutdown.
 - `primary-lock.ts` — adapter over the host's native process-owned `FileLock`
   (`@oh-my-pi/pi-natives`, dynamically imported; no fallback). A winning
   handle is strongly referenced and released at actual process exit; losing
@@ -38,9 +39,9 @@ their content.
 - `boundary.ts` — shared `asRecord`/`canonicalPath` guards for external JSON
   payloads and paths; import them, never re-copy.
 - `storage.ts` — atomic JSON writes (stage → verify → chmod → rename, with a
-  `mayPublish` recheck immediately before rename), record schema v1 and the
-  launch-intent sidecar schema, record path and `primaryRoleLockPath` (same
-  state directory and hash as the record, `.primary.lock` suffix).
+  `mayPublish` recheck immediately before rename), record schema v1, record
+  path and `primaryRoleLockPath` (same state directory and hash as the record,
+  `.primary.lock` suffix).
 
 ## Invariants
 
@@ -69,8 +70,8 @@ their content.
   foreground PID and native workspace/tab/pane reservation. Labels and repo
   paths are never proof. Fail closed on ambiguity, malformed storage, or
   unverifiable identity: preserve evidence, report the cause, mutate nothing.
-  A recorded child is torn down only by a newly admitted primary replacing it;
-  a secondary never reclaims it.
+  Only the primary retires verified recorded children; a secondary never
+  reclaims them.
 - Replacement policy: new primary replaces the retained record's child; new
   session id or verified canonical root archives + retires + launches fresh;
   same id + canonical root (including cwd moves) keeps child, notes, and
@@ -96,9 +97,10 @@ their content.
   snapshot. Artifact/snapshot destinations come from
   `sessionManager.getArtifactsDir()` (session home), never the checkout.
 - Live notes belong to Hunk. This extension journals nothing about notes: no
-  registries, no replay, no per-edit invalidation. The only destructive op is
-  the once-per-session-boundary `comment clear --all --yes` on the bound id;
-  a failed clear blocks export/annotation until the ordinary reconciler
+  registries, no replay, no per-edit invalidation. Destructive ops are exactly
+  two: the once-per-session-boundary `comment clear --all --yes` on the bound
+  id, and `pane close` retirement of a verified recorded child by the primary.
+  A failed clear blocks export/annotation until the ordinary reconciler
   retries — never `/diff`.
 - `hunk_review` binds writes to a view token (binding generation + session id +
   publication generation); old tokens never address a replacement child. The

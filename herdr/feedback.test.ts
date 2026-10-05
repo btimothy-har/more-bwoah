@@ -194,8 +194,9 @@ function mutationCalls(harness: Harness): RecordedCall[] {
 			);
 		}
 		if (call.command === "hunk" && call.args[0] === "session") {
-			const sub = call.args[2];
-			return sub === "reload" || sub === "add" || sub === "clear";
+			// `session reload <id>` carries its verb at args[1]; comment verbs
+			// sit under `session comment <add|clear> ...` at args[2].
+			return call.args[1] === "reload" || call.args[2] === "add" || call.args[2] === "clear";
 		}
 		return false;
 	});

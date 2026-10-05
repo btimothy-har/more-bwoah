@@ -99,6 +99,9 @@ launch (below).
   workspace's recorded child — left by a soft exit or a crash — before
   launching its own, matched by recorded IDs (user-renamed tabs don't matter).
   It never adopts the old review: the fresh child starts with no notes.
+  Before closing, it revalidates the child’s location, original shell, and
+  foreground ownership. A conflicting live registration or a pane repurposed
+  for another program preserves the pane and ownership evidence.
 - **Session transitions.** A new omp session id (`/new`, resuming a different
   session, fork/branch) retires the current child and launches a fresh one at
   the new session's HEAD and artifact destination. The same session id in the
@@ -110,10 +113,14 @@ launch (below).
   reconciliation recreates it automatically — no `/diff` needed. The
   replacement reviews from the same pinned baseline and selected scope, even
   if HEAD advanced meanwhile.
+  A launch proven rejected before submission also retries through ordinary
+  reconciliation; an unknown dispatch outcome is verified, never resubmitted.
 - **Transient failures stay safe.** Indeterminate Git discovery pauses review
   access without disturbing a same-parent child. A committed parent-ID change
-  still retires the old child; creation waits for Git recovery. Unreachable
-  Herdr/Hunk observations never prove absence or authorize another child.
+  still snapshots its clean applied review and retires the old child even if
+  the desired checkout cannot be resolved; creation waits for Git recovery.
+  Unreachable Herdr/Hunk observations never prove absence or authorize another
+  child.
   Ordinary lifecycle ticks retry, including failed initial note-clearing;
   export and annotation remain blocked until that clean gate succeeds.
 - **Exit is soft retirement.** On omp exit the child pane and process, its
@@ -157,8 +164,11 @@ launch (below).
 - **"Herdr integration is inactive in this secondary omp session."** — another
   omp process owns this workspace. Use `/diff` and the review tools in the
   primary; the secondary never touches its child.
-- **"needs a git repository with at least one commit"** — the cwd must be a
-  git checkout with a committed HEAD for a diff to exist.
+- **"This repository has no commits yet." / "This directory is not a git
+  repository."** — the cwd must be a git checkout with a committed HEAD for a
+  diff to exist. With Git resolution merely indeterminate (e.g. a timeout),
+  review access pauses (`the checkout cannot be resolved right now`) and
+  resumes on the next tick without disturbing the existing child.
 - **"review not ready yet"** — Hunk may still be loading; the child stays and
   a later lifecycle tick binds it. `/diff` also re-checks readiness.
 - **Transient Herdr/Hunk failures** (timeouts, socket errors, malformed

@@ -4,10 +4,13 @@
  * Failure classification (verified against herdr 0.9.3): failures exit 1 with a
  * structured envelope on stderr (`{"error":{"code":...}}`); usage errors exit
  * 2. Only the proven absence codes `tab_not_found`/`pane_not_found` mean the
- * referenced tab/pane is gone. Every other failure — socket hiccup, herdr
- * restart, timeout, malformed output — is indeterminate: callers must treat it
- * as "unknown", never as absence, or one transient error would sticky-close a
- * healthy companion or mint a duplicate tab.
+ * referenced tab/pane is gone, and only `server_not_running` proves a command
+ * was rejected before the daemon could submit it (the CLI never reached the
+ * socket). Every other failure — socket hiccup, herdr restart, timeout,
+ * malformed output, a connection lost mid-command — is indeterminate: callers
+ * must treat it as "unknown", never as absence or proven rejection, or one
+ * transient error would sticky-close a healthy companion or mint a duplicate
+ * tab.
  */
 
 import { CommandCliError, type ExecOutcome, type ExecRunner } from "./hunk-cli";
@@ -30,6 +33,11 @@ const ABSENT_BY_CODE: Record<string, true> = {
 	pane_not_found: true,
 };
 
+/** Codes proving the command was rejected before the daemon submitted anything. */
+const UNSUBMITTED_BY_CODE: Record<string, true> = {
+	server_not_running: true,
+};
+
 /** herdr proved the referenced tab/pane does not exist (structured error code). */
 export class HerdrAbsentError extends CommandCliError {
 	constructor(
@@ -41,7 +49,23 @@ export class HerdrAbsentError extends CommandCliError {
 	}
 }
 
-function absentCodeFrom(stderr: string): string | undefined {
+/**
+ * herdr proved the command was rejected before any job was submitted
+ * (structured error code). A `pane run` answered with this can never produce
+ * a foreground process later: pre-submission proof, unlike a timeout or a
+ * dropped connection.
+ */
+export class HerdrRejectedError extends CommandCliError {
+	constructor(
+		message: string,
+		readonly rejectCode: string,
+	) {
+		super(message, 1, "");
+		this.name = "HerdrRejectedError";
+	}
+}
+
+function structuredCodeFrom(stderr: string): string | undefined {
 	let parsed: unknown;
 	try {
 		parsed = JSON.parse(stderr);
@@ -51,7 +75,7 @@ function absentCodeFrom(stderr: string): string | undefined {
 	const envelope = asRecord(parsed);
 	const error = envelope ? asRecord(envelope["error"]) : null;
 	const code = error?.["code"];
-	return typeof code === "string" && ABSENT_BY_CODE[code] ? code : undefined;
+	return typeof code === "string" && (ABSENT_BY_CODE[code] || UNSUBMITTED_BY_CODE[code]) ? code : undefined;
 }
 
 export class HerdrCli {
@@ -62,7 +86,8 @@ export class HerdrCli {
 
 	/**
 	 * Run one herdr command and return its `result` payload. Throws
-	 * HerdrAbsentError only for proven absence; every other failure (including
+	 * HerdrAbsentError only for proven absence and HerdrRejectedError only for
+	 * proven pre-submission rejection; every other failure (including
 	 * kills/timeouts and malformed output) is a plain CommandCliError the
 	 * caller must treat as indeterminate.
 	 */
@@ -70,9 +95,12 @@ export class HerdrCli {
 		const outcome = await this.exec(this.herdrPath, args, { timeoutMs });
 		if (outcome.code !== 0 || outcome.killed) {
 			const detail = outcome.stderr.trim() || outcome.stdout.trim();
-			const absentCode = outcome.code === 1 && !outcome.killed ? absentCodeFrom(outcome.stderr) : undefined;
-			if (absentCode !== undefined) {
-				throw new HerdrAbsentError(`${context}: ${absentCode}`, absentCode);
+			const structuredCode = outcome.code === 1 && !outcome.killed ? structuredCodeFrom(outcome.stderr) : undefined;
+			if (structuredCode !== undefined && ABSENT_BY_CODE[structuredCode]) {
+				throw new HerdrAbsentError(`${context}: ${structuredCode}`, structuredCode);
+			}
+			if (structuredCode !== undefined && UNSUBMITTED_BY_CODE[structuredCode]) {
+				throw new HerdrRejectedError(`${context}: ${structuredCode}`, structuredCode);
 			}
 			throw new CommandCliError(
 				outcome.killed ? `${context}: herdr call timed out` : `${context}: ${detail || "herdr call failed"}`,

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { HerdrAbsentError, HerdrCli } from "./herdr-cli";
+import { HerdrAbsentError, HerdrCli, HerdrRejectedError } from "./herdr-cli";
 import { CommandCliError, type ExecOutcome, type ExecRunner, type ExecRunnerOptions } from "./hunk-cli";
 
 interface FakeCall {
@@ -67,6 +67,30 @@ describe("herdr cli boundaries", () => {
 	test("closePane surfaces proven pane_not_found absence", async () => {
 		const { exec } = runner(() => ABSENT);
 		await expect(new HerdrCli(exec, "herdr").closePane("w1:p1")).rejects.toBeInstanceOf(HerdrAbsentError);
+	});
+
+	test("pane run surfaces server_not_running as proven pre-submission rejection", async () => {
+		const { exec } = runner(() => fail(1, JSON.stringify({ error: { code: "server_not_running" } })));
+		const error = await new HerdrCli(exec, "herdr")
+			.run(["pane", "run", "w1:p1", "true"], "pane run")
+			.catch((caught: unknown) => caught);
+		expect(error).toBeInstanceOf(HerdrRejectedError);
+		expect((error as HerdrRejectedError).rejectCode).toBe("server_not_running");
+	});
+
+	test("pane run keeps a dropped connection and internal errors indeterminate", async () => {
+		for (const outcome of [
+			fail(1, JSON.stringify({ error: { code: "internal_error" } })),
+			fail(1, "connection lost"),
+			{ stdout: "", stderr: "", code: 1, killed: true },
+		]) {
+			const error = await new HerdrCli(runner(() => outcome).exec, "herdr")
+				.run(["pane", "run", "w1:p1", "true"], "pane run")
+				.catch((caught: unknown) => caught);
+			expect(error).toBeInstanceOf(CommandCliError);
+			expect(error).not.toBeInstanceOf(HerdrRejectedError);
+			expect(error).not.toBeInstanceOf(HerdrAbsentError);
+		}
 	});
 
 	test("paneState distinguishes proven absence from failure", async () => {

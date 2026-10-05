@@ -58,7 +58,7 @@ import {
 	type ReviewPublication,
 	type SessionSnapshot,
 } from "./hunk-cli";
-import { HerdrAbsentError, HerdrCli, type HerdrPane, type PaneProcessInfo } from "./herdr-cli";
+import { HerdrAbsentError, HerdrCli, HerdrRejectedError, type HerdrPane, type PaneProcessInfo } from "./herdr-cli";
 import { asRecord, canonicalPath } from "./boundary";
 import {
 	hunkReloadArgs,
@@ -151,6 +151,20 @@ interface LaunchIntent {
 	nonce: string;
 	paneId: string;
 }
+
+/**
+ * A proven child identity plus the pane-side fact it rests on:
+ * `foregroundPid` names the Hunk process that must still hold the pane
+ * foreground at close time; its absence means the proof rested on the
+ * original idle shell, which the close-time comparison requires again.
+ */
+type QualifiedChildProof = {
+	proven: true;
+	recovered?: { hunkSessionId: string; hunkPid: number };
+	foregroundPid?: number;
+};
+
+type ChildProof = QualifiedChildProof | { proven: false };
 
 export interface StableCapture {
 	capturedAt: string;
@@ -288,6 +302,8 @@ export class CompanionController {
 	#launchBeforeSessions: Set<string> | undefined;
 	#launchIntent: LaunchIntent | undefined;
 	#launchInFlight = false;
+	/** Proven pre-submission `pane run` rejection for the in-flight launch. */
+	#launchRunRejected = false;
 
 	// lifecycle
 	#shutdownStarted = false;
@@ -736,6 +752,7 @@ export class CompanionController {
 	 * can prove or report — never a silent duplicate.
 	 */
 	async #createChild(desired: ParentSnapshot, root: string): Promise<void> {
+		this.#launchRunRejected = false;
 		const recordPath = this.#recordFile();
 		const sidecarPath = `${recordPath}.launch.json`;
 		let before: Set<string>;
@@ -847,8 +864,8 @@ export class CompanionController {
 		try {
 			created = await this.#herdr.tabCreate(this.#workspaceId(), root, this.#tabCreateEnvArgs());
 		} catch (error) {
-			if (error instanceof HerdrAbsentError) {
-				// The daemon answered with a structured rejection, proving no tab
+			if (error instanceof HerdrAbsentError || error instanceof HerdrRejectedError) {
+				// The daemon answered with a structured rejection proving no tab
 				// was created: this operation's own intent is removable.
 				this.#deps.logger.warn("tab create rejected", { error });
 				await this.#removeOwnIntent();
@@ -902,8 +919,11 @@ export class CompanionController {
 	/**
 	 * Complete a started launch: capture the original idle shell, persist the
 	 * shell-qualified provisional record, remove this operation's matching-nonce
-	 * intent, then dispatch `pane run` exactly once and bind by handshake. A run
-	 * timeout keeps verifying the known provisional child; it never re-submits.
+	 * intent, then dispatch `pane run` exactly once and bind by handshake. A
+	 * structured pre-submission rejection is tracked so the ordinary drain can
+	 * verify-retire and recreate the failed provisional; a run timeout or any
+	 * unknown outcome keeps verifying the known provisional child — it never
+	 * re-submits.
 	 */
 	async #continueLaunch(
 		desired: ParentSnapshot,
@@ -968,14 +988,20 @@ export class CompanionController {
 			try {
 				await this.#herdr.run(["pane", "run", paneId, command], "pane run");
 			} catch (error) {
-				if (!(error instanceof CommandCliError && error.message.includes("timed out"))) {
-					// A proven-failed dispatch created no foreground job: leave the
-					// shell-qualified record so the next drain can decide its fate.
-					this.#deps.logger.warn("pane run dispatch failed", { error });
+				if (error instanceof HerdrAbsentError || error instanceof HerdrRejectedError) {
+					// Structured proof the daemon rejected the command before
+					// submitting it (pane gone, or the CLI never reached the
+					// socket): no foreground job can follow. The shell-qualified
+					// provisional stays recorded; the ordinary drain verifies it
+					// and recreates the child instead of resubmitting blindly.
+					this.#launchRunRejected = true;
+					this.#deps.logger.warn("pane run dispatch rejected", { error });
 					return;
 				}
-				// A run timeout may still have landed the command: fall through to
-				// verify the known provisional child — never submit `pane run` again.
+				// Timeout, dropped connection, malformed envelope: the command
+				// may or may not have been submitted. Never resubmit — verify
+				// the known provisional child through the handshake below.
+				this.#deps.logger.warn("pane run outcome unknown; verifying the provisional child", { error });
 			}
 			this.#launchBeforeSessions = before;
 			const handshake = await this.#handshake(paneId, root, before, info.shellPid, LAUNCH_TIMEOUT_MS, desired);
@@ -1069,7 +1095,29 @@ export class CompanionController {
 			);
 			return;
 		}
-		if (isIdleShell(info, record.shellPid)) return; // the launch command has no foreground job yet
+		if (isIdleShell(info, record.shellPid)) {
+			if (this.#launchRunRejected !== true) return; // a dispatched run may still surface; stay starting
+			// The dispatch was structurally rejected before submission, so the
+			// idle shell can never gain a foreground job from that command.
+			// Verify the occupant before any destructive recovery; if a live
+			// Hunk appeared anyway, the late-bind path below decides it.
+			const proof = await this.#proveChildIdentity(record, info);
+			if (!proof.proven) return; // changed or unverified occupant: decide on a later tick
+			if (proof.recovered === undefined) {
+				const outcome = await this.#retireRecordedChild(record, desired);
+				if (outcome !== "retired") return;
+				await this.#launchForContext(desired, checkout);
+				return;
+			}
+			// Nothing was submitted, so a live Hunk here is not this launch's
+			// child and the launch snapshot was never taken: it can never be
+			// proven. Stay starting and report instead of binding or touching it.
+			this.#notifyOnChange(
+				"rejected-run-foreign",
+				"Herdr: a review session appeared in the companion pane after a rejected launch; it was left untouched.",
+				"warning",
+			);
+		}
 		if (!this.#launchBeforeSessions) return; // no launch snapshot: nothing provable to bind
 		const handshake = await this.#handshake(
 			record.paneId,
@@ -1377,6 +1425,16 @@ export class CompanionController {
 				return "blocked";
 			}
 			if (this.#mutationBlocked(desired)) return "blocked";
+			// The early proof predates the awaited persists, pane list, and
+			// controller reproof. Immediately before the close dispatch,
+			// re-prove the Hunk registry (or the established idle-shell exit)
+			// and then re-observe the pane's tab/workspace/shell/foreground
+			// strictly after that proof: a changed or unverified occupant must
+			// never be closed.
+			if (!(await this.#reconfirmChildProof(record, info, proof))) return "blocked";
+			// Sync shutdown/supersession fence: nothing awaits between the final
+			// pane observation above and this close dispatch.
+			if (this.#mutationBlocked(desired)) return "blocked";
 			try {
 				await this.#herdr.closePane(record.paneId, RETIRE_CLOSE_TIMEOUT_MS);
 			} catch (error) {
@@ -1456,6 +1514,118 @@ export class CompanionController {
 	}
 
 	/**
+	 * Fresh re-proof of the recorded child immediately before its close
+	 * dispatch. The early proof can go stale across the awaited record
+	 * persists, pane list, and controller reproof; if Hunk exits during those
+	 * awaits and another program takes the original shell, closing on the
+	 * early proof would destroy the unrelated occupant.
+	 *
+	 * The awaited Hunk registry/canonical-root proof runs first, against the
+	 * early pane observation; the pane's tab/workspace/shell/foreground are
+	 * then observed once more, strictly after that proof settles, and
+	 * compared synchronously against what the qualified proof rests on. A
+	 * substitution parked inside any earlier await — including the registry
+	 * read itself — is therefore still visible to the final comparison, and
+	 * no awaited proof runs after the last native observation that could go
+	 * stale behind it. Anything changed or unverifiable keeps the pane.
+	 */
+	async #reconfirmChildProof(
+		record: CompanionRecord,
+		earlyInfo: PaneProcessInfo | "absent",
+		early: QualifiedChildProof,
+	): Promise<boolean> {
+		const qualified = await this.#proveChildIdentity(record, earlyInfo);
+		if (!qualified.proven) return false;
+		// A registry-side occupant swap between the early and pre-close proofs
+		// (different recovered identities) is a changed occupant, even though
+		// each proof holds on its own.
+		const occupantChanged =
+			early.recovered !== undefined
+				? qualified.recovered !== undefined &&
+					(qualified.recovered.hunkSessionId !== early.recovered.hunkSessionId ||
+						qualified.recovered.hunkPid !== early.recovered.hunkPid)
+				: qualified.recovered !== undefined;
+		if (occupantChanged) {
+			this.#notifyOnChange(
+				"retire-identity",
+				"Herdr: the recorded child pane's occupant changed while it was being verified; it was left untouched.",
+				"warning",
+			);
+			return false;
+		}
+
+		// Last native observation: every await below precedes the synchronous
+		// close-time comparison, and nothing is awaited again before the
+		// caller's shutdown fence and close dispatch.
+		const pane = await this.#paneState(record.paneId);
+		if (pane === "indeterminate") {
+			this.#notifyOnChange(
+				"retire-indeterminate",
+				"Herdr: could not reach herdr to re-verify the recorded child; it was left untouched.",
+				"warning",
+			);
+			return false;
+		}
+		if (pane === "absent") return true; // nothing left to protect; absence handling continues below
+		const info = await this.#paneInfo(record.paneId);
+		if (info === "indeterminate") {
+			this.#notifyOnChange(
+				"retire-indeterminate",
+				"Herdr: could not inspect the recorded child pane before closing; it was left untouched.",
+				"warning",
+			);
+			return false;
+		}
+		if (info === "absent") return true; // herdr no longer reports the pane's process; absence handling continues below
+		if (pane.tabId !== undefined && pane.tabId !== record.tabId) {
+			this.#notifyOnChange(
+				"retire-identity",
+				"Herdr: the recorded child pane moved to another tab before closing; it was left untouched.",
+				"warning",
+			);
+			return false;
+		}
+		if (pane.workspaceId !== undefined && pane.workspaceId !== this.#workspaceId()) {
+			this.#notifyOnChange(
+				"retire-identity",
+				"Herdr: the recorded child pane moved to another workspace before closing; it was left untouched.",
+				"warning",
+			);
+			return false;
+		}
+		// The qualified proof required the recorded original shell; a replaced
+		// shell means this pane is no longer the one the proof qualified.
+		if (info.shellPid !== record.shellPid) {
+			this.#notifyOnChange(
+				"retire-identity",
+				"Herdr: the recorded child pane's original shell was replaced before closing; it was left untouched.",
+				"warning",
+			);
+			return false;
+		}
+		if (qualified.foregroundPid !== undefined) {
+			if (!info.foregroundPids.includes(qualified.foregroundPid)) {
+				this.#notifyOnChange(
+					"retire-identity",
+					"Herdr: the recorded child pane's verified review no longer holds the foreground; it was left untouched.",
+					"warning",
+				);
+				return false;
+			}
+		} else if (!isIdleShell(info, record.shellPid)) {
+			// The proof rested on the established idle-shell exit; a new
+			// foreground occupant appeared since, so the pane stays.
+			this.#notifyOnChange(
+				"retire-identity",
+				"Herdr: the recorded child pane's foreground changed before closing; it was left untouched.",
+				"warning",
+			);
+			return false;
+		}
+		return true;
+	}
+
+	/**
 	 * Decide whether the recorded child is provably ours to retire: a live
 	 * verified Hunk (registry UUID/PID in the pane foreground at the canonical
 	 * recorded checkout), a recovered unique identity for a shell-qualified
@@ -1465,7 +1635,7 @@ export class CompanionController {
 	async #proveChildIdentity(
 		record: CompanionRecord,
 		info: PaneProcessInfo | "absent",
-	): Promise<{ proven: true; recovered?: { hunkSessionId: string; hunkPid: number } } | { proven: false }> {
+	): Promise<ChildProof> {
 		if (record.hunkSessionId !== undefined && record.hunkPid !== undefined) {
 			let sessions: RegisteredSession[];
 			try {
@@ -1479,6 +1649,7 @@ export class CompanionController {
 				return { proven: false };
 			}
 			const registered = sessions.find(entry => entry.sessionId === record.hunkSessionId);
+			const pidMatches = registered !== undefined && registered.pid === record.hunkPid;
 			const known =
 				registered !== undefined &&
 				registered.pid === record.hunkPid &&
@@ -1491,7 +1662,10 @@ export class CompanionController {
 				if (this.#deps.isProcessAlive(record.hunkPid) === false) {
 					return { proven: true };
 				}
-				if (known) {
+				if (registered !== undefined) {
+					// A registration still names this UUID — live at a foreign root,
+					// under a reused PID, or unverifiable. Conflicting or unknown
+					// registration evidence is not an established exit.
 					this.#notifyOnChange(
 						"retire-unproven",
 						"Herdr: the recorded child pane is gone but its review session is still registered; nothing was removed.",
@@ -1521,7 +1695,36 @@ export class CompanionController {
 				return { proven: false };
 			}
 			if (!known) {
-				if (isIdleShell(info, record.shellPid)) return { proven: true };
+				const idle = isIdleShell(info, record.shellPid);
+				const alive = this.#deps.isProcessAlive(record.hunkPid);
+				if (idle && alive === false && (registered === undefined || pidMatches)) {
+					// Established exit: the recorded PID is proven dead and no
+					// registration contradicts it (registry lag under the same PID
+					// is tolerated). Only then may the original idle shell be retired.
+					return { proven: true };
+				}
+				if (idle && registered !== undefined) {
+					// A live or unverified registration still names this UUID —
+					// e.g. it moved to a foreign canonical root. That is a
+					// conflicting live registration, not proof that the recorded
+					// Hunk exited: fail closed.
+					this.#notifyOnChange(
+						"retire-unproven",
+						"Herdr: a review session is still registered for the recorded child; it was left untouched.",
+						"warning",
+					);
+					return { proven: false };
+				}
+				if (idle) {
+					// No registration, but the recorded PID is live or unverifiable:
+					// its exit is unestablished, so the idle shell may not be retired.
+					this.#notifyOnChange(
+						"retire-unproven",
+						"Herdr: the recorded review session is no longer registered but its process state is unverified; it was left untouched.",
+						"warning",
+					);
+					return { proven: false };
+				}
 				this.#notifyOnChange(
 					"retire-unproven",
 					"Herdr: the recorded review session is no longer registered and the pane is not an idle shell; it was left untouched.",
@@ -1549,7 +1752,7 @@ export class CompanionController {
 				);
 				return { proven: false };
 			}
-			return { proven: true };
+			return { proven: true, foregroundPid: record.hunkPid };
 		}
 		if (record.shellPid !== undefined) {
 			// Shell-qualified provisional record: recover a unique live identity
@@ -1590,10 +1793,12 @@ export class CompanionController {
 			}
 			if (candidates.length === 1) {
 				// Carry the recovered UUID/PID so post-close verification proves this
-				// process's disappearance, not just the pane's.
+				// process's disappearance, not just the pane's; the close-time
+				// comparison requires this PID to still hold the foreground.
 				return {
 					proven: true,
 					recovered: { hunkSessionId: candidates[0].sessionId, hunkPid: candidates[0].pid },
+					foregroundPid: candidates[0].pid,
 				};
 			}
 			if (isIdleShell(info, record.shellPid)) return { proven: true };
@@ -1732,6 +1937,7 @@ export class CompanionController {
 		desired: ParentSnapshot,
 		root: string,
 	): Promise<void> {
+		this.#launchRunRejected = false;
 		this.#binding = binding;
 		this.#bindingEpoch += 1;
 		this.#viewToken = undefined;
@@ -1934,11 +2140,20 @@ export class CompanionController {
 		if (this.#shutdownStarted) throw new CompanionUnavailable(SHUTDOWN_MESSAGE);
 	}
 
-	#reviewBlockReason(options?: { allowPendingScope?: boolean; allowParentMoved?: boolean }): string | undefined {
+	#reviewBlockReason(options?: {
+		allowPendingScope?: boolean;
+		allowParentMoved?: boolean;
+		archive?: boolean;
+	}): string | undefined {
 		if (this.#role === "secondary") return SECONDARY_INACTIVE_MESSAGE;
 		if (this.#role === "pending") return PENDING_OWNERSHIP_MESSAGE;
 		if (this.#shutdownStarted) return SHUTDOWN_MESSAGE;
-		if (!this.#gitReady) return "Herdr: the checkout cannot be resolved right now; review access is paused.";
+		// Archive captures serve the applied binding, so indeterminate
+		// desired-checkout discovery must never block them; tool-facing review
+		// access stays gated on the current parent's Git readiness.
+		if (!options?.archive && !this.#gitReady) {
+			return "Herdr: the checkout cannot be resolved right now; review access is paused.";
+		}
 		if (this.#child !== "ready" || !this.#binding) {
 			return "Hunk review is not ready yet; try again shortly.";
 		}
@@ -2065,13 +2280,15 @@ export class CompanionController {
 	 * the captured parent revision between awaits before issuing a token.
 	 * Archive captures (`archive: true`) run for the applied parent — including
 	 * transition snapshots published while the desired parent has already moved
-	 * on — so the parent-moved gate is waived for them; readiness, the clean
-	 * gate, and the binding-epoch proof still hold, and only `final: true` runs
-	 * for a soft-shutting-down primary with no view token minted.
+	 * on — so the parent-moved gate is waived for them, and the desired
+	 * checkout's Git discovery never gates the applied child's archive;
+	 * readiness, the clean gate, and the binding-epoch proof still hold, and
+	 * only `final: true` runs for a soft-shutting-down primary with no view
+	 * token minted.
 	 */
 	async #captureInner(signal: AbortSignal | undefined, final: boolean, archive = false): Promise<CaptureOutcome> {
 		if (!final) {
-			const blocked = this.#reviewBlockReason(archive ? { allowParentMoved: true } : undefined);
+			const blocked = this.#reviewBlockReason(archive ? { allowParentMoved: true, archive: true } : undefined);
 			if (blocked) return { ok: false, reason: blocked };
 		}
 		const binding = this.#binding;
@@ -2367,9 +2584,11 @@ export class CompanionController {
 		if (this.#shutdownStarted) return;
 		this.#shutdownStarted = true;
 		this.#viewToken = undefined;
-		// In-flight creation evidence stays on disk for successor recovery; this
-		// process only forgets its memory of the intent.
-		this.#launchIntent = undefined;
+		// The in-flight creation keeps its nonce and submission state: its own
+		// cancellation removes a proven pre-submission intent (a recordless
+		// sidecar would strand the successor as an unknown creation), while a
+		// possibly-submitted intent stays on disk as durable evidence. Clearing
+		// the memory here would orphan that decision.
 		try {
 			// One final read-only archive of the still-applied clean view; the
 			// deadline stops the wait, never the write's settlement.

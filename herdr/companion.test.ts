@@ -23,6 +23,7 @@ import {
 	createTempRepo,
 	harnessEnv,
 	harnessFail,
+	herdrAbsent,
 	herdrTransient,
 	headSha,
 	killedOutcome,
@@ -733,10 +734,19 @@ describe("parent transitions and scope retention", () => {
 		await ctx.controller.reconcile(ctx.desired);
 		observe(ctx, "omp-3");
 		await ctx.controller.reconcile(ctx.desired);
+		// Return to the ORIGINAL id: an identity-only guard would pass here and
+		// apply the stale picker to the replacement child. Only the revision
+		// check must protect this reincarnation.
+		observe(ctx, "omp-1");
+		await ctx.controller.reconcile(ctx.desired);
 
 		const reloadsBefore = ctx.harness.exec.callsTo("hunk", ["session", "reload"]).length;
+		const focusesBefore = ctx.harness.focusCount;
 		await ctx.controller.selectScope({ kind: "commit", commitSha: head }, snapshotA);
+		await ctx.controller.focusTab(snapshotA);
+		// The original picker neither reloads nor focuses the replacement child.
 		expect(ctx.harness.exec.callsTo("hunk", ["session", "reload"]).length).toBe(reloadsBefore);
+		expect(ctx.harness.focusCount).toBe(focusesBefore);
 		expect(ctx.controller.scope?.kind).toBe("session");
 	});
 
@@ -1834,8 +1844,9 @@ describe("soft shutdown", () => {
 		expect(await ctx.controller.admit()).toBe("primary");
 		// Park the post-close registry read so the retirement's verification is
 		// still awaiting when the process shuts down; the parked release then
-		// reports the emptied registry.
-		const gate = gateNthCall(ctx, "hunk", ["session", "list"], 2, () => ({
+		// reports the emptied registry. (The early proof and the pre-close
+		// re-proof each consume one earlier registry read.)
+		const gate = gateNthCall(ctx, "hunk", ["session", "list"], 3, () => ({
 			stdout: JSON.stringify({ sessions: [] }),
 			stderr: "",
 			code: 0,
@@ -2372,5 +2383,445 @@ describe("durable bound identity", () => {
 		const stable = await ctx.controller.captureStable();
 		expect(stable.ok).toBe(true);
 		expect(record.hunkSessionId).toBe(stable.capture?.hunkSessionId);
+	});
+});
+
+describe("runtime defect regressions", () => {
+	test("retirement re-proves the child before closing; a changed occupant is never closed", async () => {
+		const ctx = await freshContext();
+		cleaners.push(ctx.cleanup);
+		await startPrimary(ctx);
+		const paneId = childPaneIds(ctx)[0];
+		const oldSession = killChildHunk(ctx, paneId); // proven exit: idle-shell retirement path
+
+		// Park the pre-close re-proof's registry read (after the health read and
+		// the early proof); while it is parked, another program takes the
+		// original shell. The re-proof's pane observation runs only after that
+		// registry read settles, so it must see the substituted occupant and
+		// refuse the close the earlier proofs authorized.
+		const gate = gateNthCall(
+			ctx,
+			"hunk",
+			["session", "list"],
+			3,
+			() => ({
+				stdout: JSON.stringify({
+					sessions: ctx.harness.sessions.map(session => ({
+						sessionId: session.sessionId,
+						pid: session.pid,
+						cwd: session.cwd,
+						repoRoot: session.repoRoot,
+						inputKind: "vcs",
+					})),
+				}),
+				stderr: "",
+				code: 0,
+				killed: false,
+			}),
+		);
+		const draining = ctx.controller.reconcile(ctx.desired);
+		await gate.entered;
+		const pane = ctx.harness.panes.get(paneId);
+		if (pane === undefined) throw new Error("missing child pane fixture");
+		const foreignPid = ++ctx.harness.nextPid;
+		pane.foreground = [foreignPid];
+		gate.release();
+		await draining;
+		gate.dispose();
+
+		// The stale early proof was rejected: the unrelated occupant's pane was
+		// never closed and no metadata moved.
+		expect(closeCalls(ctx, paneId)).toBe(0);
+		expect(ctx.harness.panes.has(paneId)).toBe(true);
+		expect(await fileExists(ctx.recordPath)).toBe(true);
+		expect(ctx.harness.tabCreateCount).toBe(1);
+
+		// Once the occupant question is resolved, the same reconciliation path
+		// retires and recreates without any /diff override.
+		pane.foreground = [];
+		observe(ctx, "omp-1");
+		await ctx.controller.reconcile(ctx.desired);
+		expect(closeCalls(ctx, paneId)).toBe(1);
+		expect(ctx.harness.panes.has(paneId)).toBe(false);
+		expect(ctx.harness.sessions.some(entry => entry.sessionId === oldSession.sessionId)).toBe(false);
+		expect(ctx.harness.tabCreateCount).toBe(2);
+		expect(ctx.controller.isReady).toBe(true);
+	});
+
+	test("retirement re-proves a live retained Hunk before closing; a substituted foreground is never closed", async () => {
+		const ctx = await freshContext();
+		cleaners.push(ctx.cleanup);
+		const seeded = await seedLiveChild(ctx);
+
+		// Park the pre-close re-proof's registry read (the early proof consumes
+		// the first); while it is parked, a foreign program takes the verified
+		// child's foreground. The re-proof's pane observation runs only after
+		// that registry read settles, so it must see the substitution and
+		// refuse the close the earlier proof authorized.
+		const gate = gateNthCall(
+			ctx,
+			"hunk",
+			["session", "list"],
+			2,
+			() => ({
+				stdout: JSON.stringify({
+					sessions: ctx.harness.sessions.map(session => ({
+						sessionId: session.sessionId,
+						pid: session.pid,
+						cwd: session.cwd,
+						repoRoot: session.repoRoot,
+						inputKind: "vcs",
+					})),
+				}),
+				stderr: "",
+				code: 0,
+				killed: false,
+			}),
+		);
+		expect(await ctx.controller.admit()).toBe("primary");
+		const draining = ctx.controller.reconcile(ctx.desired);
+		await gate.entered;
+		const pane = ctx.harness.panes.get(seeded.paneId);
+		if (pane === undefined) throw new Error("missing child pane fixture");
+		pane.foreground = [++ctx.harness.nextPid];
+		gate.release();
+		await draining;
+		gate.dispose();
+
+		// The verified live child is never closed on a stale foreground proof
+		// and no metadata moved.
+		expect(closeCalls(ctx, seeded.paneId)).toBe(0);
+		expect(ctx.harness.panes.has(seeded.paneId)).toBe(true);
+		expect(ctx.harness.sessions).toContain(seeded.session);
+		expect((await readRecord(ctx)).hunkSessionId).toBe(seeded.session.sessionId);
+		expect(ctx.harness.tabCreateCount).toBe(0);
+
+		// Once the occupant question is resolved, the same reconciliation path
+		// retires the verified child and launches the replacement.
+		pane.foreground = [seeded.session.pid];
+		await ctx.controller.reconcile(ctx.desired);
+		expect(closeCalls(ctx, seeded.paneId)).toBe(1);
+		expect(ctx.harness.panes.has(seeded.paneId)).toBe(false);
+		expect(ctx.harness.sessions.some(entry => entry.sessionId === seeded.session.sessionId)).toBe(false);
+		expect(ctx.harness.tabCreateCount).toBe(1);
+		expect(ctx.controller.isReady).toBe(true);
+	});
+
+	test("a conflicting live registration blocks idle-shell retirement", async () => {
+		const ctx = await freshContext();
+		cleaners.push(ctx.cleanup);
+		const seeded = await seedLiveChild(ctx);
+		// The recorded UUID/PID is still live and registered, but its canonical
+		// root no longer matches the record, and the pane shows only the
+		// original shell. A conflicting LIVE registration is not a Hunk exit.
+		seeded.session.repoRoot = "/elsewhere";
+		seeded.session.cwd = "/elsewhere";
+		const occupied = ctx.harness.panes.get(seeded.paneId);
+		if (occupied !== undefined) occupied.foreground = [seeded.shellPid];
+
+		expect(await ctx.controller.admit()).toBe("primary");
+		await ctx.controller.reconcile(ctx.desired);
+
+		expect(closeCalls(ctx, seeded.paneId)).toBe(0);
+		expect(ctx.harness.panes.has(seeded.paneId)).toBe(true);
+		expect(ctx.harness.sessions).toContain(seeded.session);
+		expect(await fileExists(ctx.recordPath)).toBe(true);
+		expect(ctx.harness.tabCreateCount).toBe(0);
+		expect(ctx.notifications.some(message => message.includes("still registered"))).toBe(true);
+	});
+
+	test("an unverified recorded process blocks idle-shell retirement", async () => {
+		const ctx = await freshContext();
+		cleaners.push(ctx.cleanup);
+		const shellPid = ++ctx.harness.nextPid;
+		ctx.harness.panes.set("w1:p1", { tabId: "w1:t1", shellPid, foreground: [shellPid] });
+		// Nothing is registered for this UUID and the recorded PID was never
+		// minted: its liveness is unknown, so its exit is unestablished.
+		await seedRecord(ctx, {
+			tabId: "w1:t1",
+			paneId: "w1:p1",
+			shellPid,
+			repoRoot: await canon(ctx.repo.path),
+			hunkSessionId: "ghost",
+			hunkPid: 4_000_000,
+		});
+
+		expect(await ctx.controller.admit()).toBe("primary");
+		await ctx.controller.reconcile(ctx.desired);
+
+		expect(closeCalls(ctx, "w1:p1")).toBe(0);
+		expect(ctx.harness.panes.has("w1:p1")).toBe(true);
+		expect(await fileExists(ctx.recordPath)).toBe(true);
+		expect(ctx.harness.tabCreateCount).toBe(0);
+		expect(ctx.notifications.some(message => message.includes("unverified"))).toBe(true);
+	});
+
+	test("a proven rejected pane run is verified, retired, and recreated by the ordinary drain", async () => {
+		const ctx = await freshContext();
+		cleaners.push(ctx.cleanup);
+		expect(await ctx.controller.admit()).toBe("primary");
+
+		// Reject exactly one dispatch with herdr's structured pre-submission
+		// code; later dispatches fall through to the normal daemon handler.
+		let rejected = false;
+		const undo = ctx.harness.exec.override(
+			call => call.command === "herdr" && call.args[0] === "pane" && call.args[1] === "run" && !rejected,
+			call => {
+				rejected = true;
+				ctx.harness.launchedCommands.push(call.args[3] ?? "");
+				queueMicrotask(undo);
+				return {
+					stdout: "",
+					stderr: `${JSON.stringify({ error: { code: "server_not_running" } })}\n`,
+					code: 1,
+					killed: false,
+				};
+			},
+		);
+		await ctx.controller.reconcile(ctx.desired);
+
+		// The rejected dispatch left a shell-qualified provisional: starting,
+		// idle pane, no Hunk session, and no duplicate creation.
+		expect(ctx.controller.childState).toBe("starting");
+		expect(ctx.harness.tabCreateCount).toBe(1);
+		const paneId = childPaneIds(ctx)[0];
+		expect(paneId).toBeDefined();
+		expect(ctx.harness.panes.get(paneId)?.foreground).toEqual([]);
+		expect(ctx.harness.launchedCommands.length).toBe(1);
+		expect(ctx.harness.sessions.length).toBe(0);
+
+		// The ordinary drain verifies the failed idle provisional, retires it,
+		// and recreates the child: one new tab and one new run.
+		observe(ctx, "omp-1");
+		await ctx.controller.reconcile(ctx.desired);
+
+		expect(closeCalls(ctx, paneId)).toBe(1);
+		expect(ctx.harness.panes.has(paneId)).toBe(false);
+		expect(ctx.harness.tabCreateCount).toBe(2);
+		expect(ctx.harness.launchedCommands.length).toBe(2);
+		expect(ctx.controller.childState).toBe("ready");
+		expect(ctx.controller.isReady).toBe(true);
+		expect(ctx.harness.sessions.length).toBe(1);
+
+		// Healthy ticks create and run nothing further.
+		const createsAfter = ctx.harness.tabCreateCount;
+		const runsAfter = ctx.harness.launchedCommands.length;
+		observe(ctx, "omp-1");
+		await ctx.controller.reconcile(ctx.desired);
+		expect(ctx.harness.tabCreateCount).toBe(createsAfter);
+		expect(ctx.harness.launchedCommands.length).toBe(runsAfter);
+	});
+
+	test("an unknown pane-run outcome binds through verification when the run landed", async () => {
+		const ctx = await freshContext();
+		cleaners.push(ctx.cleanup);
+		expect(await ctx.controller.admit()).toBe("primary");
+		const root = await canon(ctx.repo.path);
+
+		// Real herdr 0.9.3 answers a successful pane run with an empty code-0
+		// envelope: classification stays "unknown", so the bind must happen by
+		// verification and the command must never be submitted twice.
+		const undo = ctx.harness.exec.override(
+			call => call.command === "herdr" && call.args[0] === "pane" && call.args[1] === "run",
+			call => {
+				const pane = ctx.harness.panes.get(call.args[2] ?? "");
+				if (pane === undefined) return herdrAbsent("pane_not_found");
+				ctx.harness.launchedCommands.push(call.args[3] ?? "");
+				ctx.harness.addSession(root, call.args[2] ?? "");
+				ctx.harness.registered = true;
+				return { stdout: "", stderr: "", code: 0, killed: false };
+			},
+		);
+		await withPump(ctx, ctx.controller.reconcile(ctx.desired));
+		undo();
+
+		expect(ctx.harness.launchedCommands.length).toBe(1);
+		expect(ctx.harness.tabCreateCount).toBe(1);
+		expect(ctx.controller.childState).toBe("ready");
+		expect(ctx.controller.isReady).toBe(true);
+	});
+
+	test("an unknown pane-run outcome never resubmits while it cannot be verified", async () => {
+		const ctx = await freshContext();
+		cleaners.push(ctx.cleanup);
+		expect(await ctx.controller.admit()).toBe("primary");
+
+		const undo = ctx.harness.exec.override(
+			call => call.command === "herdr" && call.args[0] === "pane" && call.args[1] === "run",
+			call => {
+				ctx.harness.launchedCommands.push(call.args[3] ?? "");
+				return harnessFail("connection lost");
+			},
+		);
+		await withPump(ctx, ctx.controller.reconcile(ctx.desired));
+		undo();
+
+		// The dispatch may have been submitted: no blind resubmission, no
+		// speculative retirement, and no duplicate child.
+		expect(ctx.harness.launchedCommands.length).toBe(1);
+		expect(ctx.harness.tabCreateCount).toBe(1);
+		expect(ctx.controller.childState).toBe("starting");
+		const paneId = childPaneIds(ctx)[0];
+		expect(ctx.harness.panes.has(paneId)).toBe(true);
+		expect(closeCalls(ctx, paneId)).toBe(0);
+
+		// Later drains keep verifying the same provisional child instead of
+		// resubmitting the unknown command.
+		observe(ctx, "omp-1");
+		await ctx.controller.reconcile(ctx.desired);
+		expect(ctx.harness.launchedCommands.length).toBe(1);
+		expect(ctx.harness.tabCreateCount).toBe(1);
+		expect(ctx.controller.childState).toBe("starting");
+	});
+
+	test("a transition archive publishes retained notes despite indeterminate git discovery", async () => {
+		const ctx = await freshContext();
+		cleaners.push(ctx.cleanup);
+		await startPrimary(ctx);
+		const oldPaneId = childPaneIds(ctx)[0];
+		const oldSession = ctx.harness.sessions[0];
+		oldSession.notes = [{ noteId: "n1", body: "retained human note" }];
+
+		const undo = ctx.harness.exec.override(
+			call => call.command === "git" && call.args[0] === "rev-parse",
+			() => harnessFail("git timeout"),
+		);
+		observe(ctx, "omp-2");
+		await ctx.controller.reconcile(ctx.desired);
+		undo();
+
+		// The applied child's clean view was archived to the old parent's
+		// destination before retirement, even though desired-checkout discovery
+		// was indeterminate.
+		const archived = JSON.parse(await nodeFs.readFile(ctx.artifactsFile, "utf8")) as Record<string, unknown>;
+		expect(archived.ompSessionId).toBe("omp-1");
+		expect(archived.hunkSessionId).toBe(oldSession.sessionId);
+		expect(JSON.stringify(archived.review)).toContain("retained human note");
+		expect(ctx.harness.panes.has(oldPaneId)).toBe(false);
+		expect(closeCalls(ctx, oldPaneId)).toBe(1);
+
+		// Tool-facing review access stays Git-gated for the current parent.
+		const gated = await ctx.controller.captureStable();
+		expect(gated.ok).toBe(false);
+		expect(gated.reason).toContain("checkout cannot be resolved");
+
+		// Once discovery resolves, the ordinary path binds a fresh child and
+		// publishes its clean view without the old notes.
+		observe(ctx, "omp-2");
+		await ctx.controller.reconcile(ctx.desired);
+		expect(ctx.harness.tabCreateCount).toBe(2);
+		expect(ctx.controller.isReady).toBe(true);
+		const fresh = JSON.parse(await nodeFs.readFile(ctx.artifactsFile, "utf8")) as Record<string, unknown>;
+		expect(fresh.ompSessionId).toBe("omp-2");
+		expect(JSON.stringify(fresh.review)).not.toContain("retained human note");
+	});
+
+	test("shutdown during a pre-submission launch leaves no recordless launch intent", async () => {
+		const ctx = await freshContext();
+		cleaners.push(ctx.cleanup);
+		expect(await ctx.controller.admit()).toBe("primary");
+
+		// Park the creation's final controller lookup before `tab create`: the
+		// sidecar exists, the intent is pre-submission, nothing was submitted.
+		const gate = gateNthCall(
+			ctx,
+			"herdr",
+			["pane", "get", HARNESS_AGENT_PANE],
+			2,
+			() => ({
+				stdout: JSON.stringify({
+					result: { pane: { pane_id: HARNESS_AGENT_PANE, tab_id: HARNESS_AGENT_TAB, workspace_id: HARNESS_WORKSPACE } },
+				}),
+				stderr: "",
+				code: 0,
+				killed: false,
+			}),
+		);
+		const draining = ctx.controller.reconcile(ctx.desired);
+		await gate.entered;
+		expect(await sidecarExists(ctx)).toBe(true);
+
+		await ctx.controller.shutdown(1_500);
+		gate.release();
+		await draining;
+		gate.dispose();
+
+		// Zero submitted creates: the operation's own cancellation removed its
+		// matching-nonce intent even across shutdown — no recordless sidecar
+		// can strand a successor as an unknown creation.
+		expect(ctx.harness.tabCreateCount).toBe(0);
+		expect(await sidecarExists(ctx)).toBe(false);
+		expect(await fileExists(ctx.recordPath)).toBe(false);
+		expect(ctx.harness.launchedCommands.length).toBe(0);
+	});
+
+	test("shutdown retains submitted creation evidence for the successor", async () => {
+		const ctx = await freshContext();
+		cleaners.push(ctx.cleanup);
+		expect(await ctx.controller.admit()).toBe("primary");
+
+		// Park the launch's shell wait after `tab create` was submitted.
+		let releaseShell: (() => void) | undefined;
+		const shellStarted = Promise.withResolvers<void>();
+		const undo = ctx.harness.exec.override(
+			call =>
+				call.command === "herdr" &&
+				call.args[0] === "pane" &&
+				call.args[1] === "process-info" &&
+				call.args[3] !== HARNESS_AGENT_PANE,
+			call => {
+				const { promise, resolve } = Promise.withResolvers<ExecOutcome>();
+				shellStarted.resolve();
+				releaseShell = () => {
+					undo();
+					const pane = ctx.harness.panes.get(call.args[3] ?? "");
+					resolve({
+						stdout: JSON.stringify({
+							result: {
+								process_info: {
+									pane_id: call.args[3] ?? "",
+									shell_pid: pane?.shellPid ?? 0,
+									...(pane !== undefined && pane.foreground.length > 0
+										? { foreground_processes: pane.foreground.map(pid => ({ pid })) }
+										: {}),
+								},
+							},
+						}),
+						stderr: "",
+						code: 0,
+						killed: false,
+					});
+				};
+				return promise;
+			},
+		);
+
+		const draining = ctx.controller.reconcile(ctx.desired);
+		await shellStarted.promise;
+		await ctx.controller.shutdown(1_500);
+		releaseShell?.();
+		await draining;
+		undo();
+
+		// A submitted creation keeps its durable evidence across shutdown: the
+		// shell-qualified provisional record and sidecar survive and nothing
+		// else was dispatched.
+		expect(ctx.harness.tabCreateCount).toBe(1);
+		expect(await fileExists(ctx.recordPath)).toBe(true);
+		expect(await sidecarExists(ctx)).toBe(true);
+		expect((await readRecord(ctx)).hunkSessionId).toBeUndefined();
+		expect(ctx.harness.launchedCommands.length).toBe(0);
+
+		// The successor resolves the retained provisional through the ordinary
+		// path: it verifies the idle-shell child, replaces it, and binds a
+		// fresh review — no unknown-creation block, no duplicate launch.
+		ctx.harness.locks.simulateProcessExit(ctx.lockPath);
+		const successor = new CompanionController(ctx.deps);
+		successor.observeParent(ctx.desired);
+		expect(await successor.admit()).toBe("primary");
+		await successor.reconcile(ctx.desired);
+		expect(ctx.harness.tabCreateCount).toBe(2);
+		expect(successor.childState).toBe("ready");
+		expect(await sidecarExists(ctx)).toBe(false);
 	});
 });
